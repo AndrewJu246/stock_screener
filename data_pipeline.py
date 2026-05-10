@@ -36,73 +36,147 @@ def get_universe() -> list[str]:
     cache_file = CACHE_DIR / "universe.json"
     cache_age = _cache_age_hours(cache_file)
 
-    # Refresh universe weekly
+    # Refresh universe weekly, but never use an empty cached list
     if cache_age is not None and cache_age < 168:
         with open(cache_file) as f:
-            return json.load(f)
+            cached = json.load(f)
+        if len(cached) > 50:  # Don't use a broken/empty cache
+            return cached
+        else:
+            logger.warning(f"Cached universe only has {len(cached)} tickers — refreshing")
 
     if UNIVERSE_MODE == "sp1500":
         tickers = _fetch_sp1500()
     else:
         tickers = _fetch_full_universe()
 
-    with open(cache_file, "w") as f:
-        json.dump(tickers, f)
+    # Only cache if we got a reasonable number of tickers
+    if len(tickers) > 50:
+        with open(cache_file, "w") as f:
+            json.dump(tickers, f)
 
     logger.info(f"Universe loaded: {len(tickers)} tickers ({UNIVERSE_MODE})")
     return tickers
 
 
 def _fetch_sp1500() -> list[str]:
-    """Fetch S&P 500 + MidCap 400 + SmallCap 600 from Wikipedia."""
+    """Backward compat — now routes to NASDAQ universe."""
+    return _fetch_nasdaq_universe()
+
+
+def _fetch_nasdaq_universe() -> list[str]:
+    """
+    Fetch all US-traded stocks from NASDAQ's official screener API.
+    Returns tickers for common stocks (filters out ETFs, warrants, etc).
+    """
+    import urllib.request
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Accept": "application/json",
+    }
+
     tickers = set()
 
     try:
-        # S&P 500
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        url = (
+            "https://api.nasdaq.com/api/screener/stocks"
+            "?tableType=traded&limit=10000&offset=0"
         )
-        sp500 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        tickers.update(sp500)
-    except Exception as e:
-        logger.warning(f"Failed to fetch S&P 500 list: {e}")
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
 
-    try:
-        # S&P MidCap 400
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
-        )
-        sp400 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        tickers.update(sp400)
-    except Exception as e:
-        logger.warning(f"Failed to fetch S&P 400 list: {e}")
+        rows = raw.get("data", {}).get("table", {}).get("rows", [])
+        logger.info(f"NASDAQ API returned {len(rows)} securities")
 
-    try:
-        # S&P SmallCap 600
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
-        )
-        sp600 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        tickers.update(sp600)
+        for row in rows:
+            symbol = row.get("symbol", "").strip()
+            market_cap = row.get("marketCap", "")
+
+            # Skip blank symbols
+            if not symbol:
+                continue
+
+            # Skip symbols with special characters (warrants, units, etc)
+            # Valid tickers: letters, possibly a hyphen (BRK-B), up to 5 chars
+            if not all(c.isalpha() or c == "-" for c in symbol):
+                continue
+            if len(symbol) > 5:
+                continue
+
+            # Skip if market cap is empty/zero (usually means it's not a real stock)
+            # NASDAQ returns market cap as a string like "1,234,567,890"
+            if market_cap:
+                try:
+                    mcap_num = float(str(market_cap).replace(",", ""))
+                    # Our quality gate requires $300M, but we fetch down to $100M
+                    # to catch stocks approaching the threshold
+                    if mcap_num < 100_000_000:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            tickers.add(symbol)
+
+        logger.info(f"After filtering: {len(tickers)} tradeable stocks")
+
     except Exception as e:
-        logger.warning(f"Failed to fetch S&P 600 list: {e}")
+        logger.warning(f"NASDAQ API fetch failed: {e}")
+
+    # Fallback if NASDAQ API fails
+    if len(tickers) < 50:
+        logger.warning("NASDAQ API failed — using hardcoded fallback universe")
+        tickers.update(FALLBACK_TICKERS)
 
     return sorted(tickers)
 
 
 def _fetch_full_universe() -> list[str]:
-    """
-    Fetch all US-listed stocks. Uses a pre-built list from NASDAQ FTP
-    or falls back to a broad ETF screening approach.
-    """
-    # For full universe, we can use the NASDAQ traded list
-    # This is a placeholder - in production, you'd pull from NASDAQ FTP
-    # For now, start with S&P 1500 and log a note
-    logger.info(
-        "Full universe mode: starting with S&P 1500. "
-        "To scan all ~8000 stocks, add a NASDAQ FTP data source."
-    )
-    return _fetch_sp1500()
+    """Fetch all US-traded stocks from NASDAQ."""
+    return _fetch_nasdaq_universe()
+
+
+# Hardcoded fallback: ~300 high-liquidity tickers across sectors
+# Used only if NASDAQ API is unreachable
+FALLBACK_TICKERS = [
+    # Tech / Semiconductors
+    "AAPL","MSFT","NVDA","AMD","AVGO","INTC","QCOM","TXN","MU","MRVL","ARM","SMCI","ANET",
+    "ADI","NXPI","ON","LRCX","KLAC","AMAT","ASML",
+    # Software / Cloud
+    "CRWD","PLTR","NOW","PANW","SNOW","DDOG","NET","ZS","FTNT","HUBS","TEAM","MDB","BILL",
+    "TTD","DKNG","APP","TOST","DUOL","SHOP","SQ","COIN",
+    # Big tech / Internet
+    "GOOGL","AMZN","META","NFLX","TSLA","UBER","ABNB","SPOT","SNAP","PINS","RBLX",
+    # Healthcare / Biotech
+    "LLY","UNH","JNJ","ABBV","MRK","PFE","TMO","ABT","AMGN","GILD","ISRG","DXCM",
+    "VRTX","REGN","MRNA","BIIB","ILMN","ZTS","EW","BSX","MDT",
+    # Financials
+    "JPM","BAC","GS","MS","BLK","SCHW","C","WFC","AXP","V","MA","PYPL","FIS",
+    "ICE","CME","MCO","SPGI","COF","DFS",
+    # Industrials / Defense
+    "GE","CAT","HON","RTX","LMT","NOC","GD","BA","DE","EMR","ETN","ITW",
+    "AXON","RKLB","GEV","CARR","TT","PH","ROK",
+    # Consumer
+    "COST","WMT","TGT","HD","LOW","NKE","SBUX","MCD","YUM","CMG","DPZ",
+    "LULU","ELF","DECK","BURL","ROST","TJX","ORLY","AZO",
+    # Energy / Utilities
+    "XOM","CVX","COP","SLB","EOG","PXD","OXY","VST","CEG","NEE","DUK","SO","AEP",
+    # Clean energy
+    "ENPH","SEDG","FSLR","RUN","PLUG","BE",
+    # Communication
+    "DIS","CMCSA","T","VZ","TMUS","CHTR",
+    # Materials
+    "LIN","APD","SHW","ECL","NEM","FCX","STLD","NUE",
+    # REITs
+    "PLD","AMT","CCI","EQIX","SPG","O","WELL","DLR",
+    # Consumer Staples
+    "PG","KO","PEP","PM","MO","CL","EL","STZ","MNST",
+    # Other notable
+    "BRK-B","MELI","MSTR","IONQ","SOFI","HOOD","RIVN","LCID",
+    "CRSP","BEAM","NTLA","EDIT",
+    "CRM","ORCL","IBM","ADBE","INTU",
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -316,6 +316,23 @@ def run_scan(
                 f"{r['sector']:<20}"
             )
 
+    # ── Step 10: Prediction tracker ───────────────────────────────────
+    try:
+        from tracker import log_predictions, update_predictions
+        new_logged = log_predictions(output)
+        if new_logged > 0:
+            logger.info(f"Tracker: {new_logged} new predictions logged")
+        # Also update existing predictions with current prices
+        update_result = update_predictions()
+        if update_result["updated"] > 0:
+            logger.info(
+                f"Tracker: updated {update_result['updated']} existing predictions "
+                f"({update_result['total_active']} active, "
+                f"{update_result['total_completed']} completed)"
+            )
+    except Exception as e:
+        logger.warning(f"Tracker integration error (non-fatal): {e}")
+
     return output
 
 

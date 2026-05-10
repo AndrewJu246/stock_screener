@@ -86,7 +86,7 @@ def apply_quality_gate(stock_result: dict) -> dict:
     if vol_pct is not None:
         # Typical stock has ~2-3% daily range; lottery stocks have 8%+
         # We flag anything >2.5x the typical ~2.5% = ~6.25%
-        vol_excessive = vol_pct > 0.065
+        vol_excessive = vol_pct > 0.075  # Loosened from 0.065 based on backtest
         checks["volatility"] = {
             "passed": not vol_excessive,
             "detail": f"Avg daily range: {vol_pct:.1%}" + (

@@ -3,12 +3,35 @@ Composite scorer: combines signal scores with regime-aware weights,
 detects market regime, and classifies candidates into strategy buckets.
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 from config import REGIMES, POSITION_SIZING
 
 logger = logging.getLogger(__name__)
+
+WEIGHT_OVERRIDES_FILE = Path("weight_overrides.json")
+
+
+def _get_weights(regime: str) -> dict:
+    """
+    Get signal weights for a regime, applying optimizer overrides if available.
+    """
+    base_weights = REGIMES[regime]["weights"]
+
+    if WEIGHT_OVERRIDES_FILE.exists():
+        try:
+            with open(WEIGHT_OVERRIDES_FILE) as f:
+                overrides = json.load(f)
+            if regime in overrides and isinstance(overrides[regime], dict):
+                logger.info(f"Using optimized weights for '{regime}' regime")
+                return overrides[regime]
+        except Exception as e:
+            logger.debug(f"Could not load weight overrides: {e}")
+
+    return base_weights
 
 
 def detect_regime(market_data: dict) -> str:
@@ -59,7 +82,7 @@ def compute_composite_score(
     }
     """
     signals = stock_signals.get("signals", {})
-    weights = REGIMES[regime]["weights"]
+    weights = _get_weights(regime)
 
     # Compute weighted score
     composite = 0
