@@ -242,6 +242,16 @@ def main():
         logger.info("Starting scheduled scan...")
         from screener import run_scan
         results = run_scan(capital=args.capital)
+
+        # Run paper trader if initialized
+        try:
+            from paper_trader import run_daily as paper_trade
+            paper_result = paper_trade()
+            if paper_result:
+                logger.info("Paper trading updated")
+        except Exception as e:
+            logger.debug(f"Paper trading skipped: {e}")
+
         digest = generate_digest(results)
     else:
         digest = generate_digest()

@@ -145,6 +145,7 @@ def run_scan(
     processed = 0
     skipped = 0
     gate_rejected = 0
+    prefilter_skipped = 0
 
     for i, ticker in enumerate(universe):
         if ticker not in price_data:
@@ -156,9 +157,35 @@ def run_scan(
         # Progress logging
         if (i + 1) % 100 == 0:
             logger.info(f"  Progress: {i + 1}/{len(universe)} "
-                        f"({processed} scored, {gate_rejected} rejected)")
+                        f"({processed} scored, {prefilter_skipped} pre-filtered, "
+                        f"{gate_rejected} gate-rejected)")
 
         try:
+            # ── Pre-filter: cheap price-based checks first ────────────
+            # Compute signals we can get from price data alone (free).
+            # If none are interesting, skip the expensive API calls.
+            from signals import volume_anomaly_score, momentum_score, volatility_ratio
+
+            pre_vol = volume_anomaly_score(hist).get("score", 0)
+            pre_mom = momentum_score(hist).get("score", 0)
+
+            # Quick volume check from price data
+            if len(hist) >= 20:
+                avg_vol = hist["Volume"].iloc[-20:].mean()
+                if avg_vol < QUALITY_GATE["min_avg_volume"]:
+                    prefilter_skipped += 1
+                    continue
+
+            # If both price-based signals are weak, skip expensive calls.
+            # A stock needs ≥2 signals at ≥50 to pass the quality gate.
+            # If volume AND momentum are both below 35, it would need
+            # ALL other signals to be high — extremely unlikely.
+            best_price_signal = max(pre_vol, pre_mom)
+            if best_price_signal < 30:
+                prefilter_skipped += 1
+                continue
+
+            # ── Passed pre-filter: fetch expensive data ───────────────
             # Get financial data (uses cache)
             financials = get_financials(ticker)
 
@@ -253,6 +280,21 @@ def run_scan(
     for i, r in enumerate(top_candidates):
         r["rank"] = i + 1
 
+    # ── Step 7b: Diversification guard ────────────────────────────────
+    try:
+        from diversifier import diversify_candidates
+        top_candidates = diversify_candidates(top_candidates)
+    except Exception as e:
+        logger.warning(f"Diversification skipped: {e}")
+
+    # ── Step 7c: Earnings calendar check ──────────────────────────────
+    try:
+        from earnings_calendar import apply_earnings_filter
+        logger.info("Checking earnings calendar...")
+        top_candidates = apply_earnings_filter(top_candidates)
+    except Exception as e:
+        logger.warning(f"Earnings calendar check skipped: {e}")
+
     elapsed = time.time() - start_time
 
     # ── Step 8: Build summary ─────────────────────────────────────────
@@ -266,6 +308,7 @@ def run_scan(
         "price_data_loaded": len(price_data),
         "stocks_scored": processed,
         "gate_rejected": gate_rejected,
+        "prefilter_skipped": prefilter_skipped,
         "skipped": skipped,
         "candidates_returned": len(top_candidates),
         "elapsed_seconds": round(elapsed, 1),
@@ -295,7 +338,8 @@ def run_scan(
     logger.info(f"\n{'='*60}")
     logger.info(f"SCAN COMPLETE in {elapsed:.1f}s")
     logger.info(f"  Universe: {len(universe)} | Scored: {processed} | "
-                f"Rejected: {gate_rejected} | Skipped: {skipped}")
+                f"Rejected: {gate_rejected} | Pre-filtered: {prefilter_skipped} | "
+                f"Skipped: {skipped}")
     logger.info(f"  Regime: {regime}")
     logger.info(f"  Top candidates: {len(top_candidates)}")
     logger.info(f"  Results saved to: {results_path}")

@@ -71,18 +71,15 @@ def compute_composite_score(
     also_compute_balanced: bool = True,
 ) -> dict:
     """
-    Compute the weighted composite score using regime-specific weights.
-
-    Returns: {
-        "composite_score": float (0-100),
-        "regime": str,
-        "regime_weights": dict,
-        "signal_contributions": dict,
-        "balanced_score": float (if also_compute_balanced),
-    }
+    Compute the weighted composite score using regime-specific weights,
+    adjusted by market cap tier.
     """
     signals = stock_signals.get("signals", {})
+    market_cap = stock_signals.get("market_cap", 0)
     weights = _get_weights(regime)
+
+    # Apply market cap tier adjustments
+    weights = _adjust_weights_for_market_cap(weights, market_cap)
 
     # Compute weighted score
     composite = 0
@@ -98,12 +95,15 @@ def compute_composite_score(
             "contribution": round(contribution, 2),
         }
 
+    tier = _get_market_cap_tier(market_cap)
+
     result = {
         "composite_score": round(composite, 2),
         "regime": regime,
         "regime_description": REGIMES[regime]["description"],
         "regime_weights": weights,
         "signal_contributions": contributions,
+        "market_cap_tier": tier,
     }
 
     # Also compute balanced score for comparison
@@ -119,6 +119,56 @@ def compute_composite_score(
         result["balanced_score"] = result["composite_score"]
 
     return result
+
+
+def _get_market_cap_tier(market_cap: float) -> str:
+    if market_cap >= 50_000_000_000:
+        return "large_cap"
+    elif market_cap >= 2_000_000_000:
+        return "mid_cap"
+    elif market_cap > 0:
+        return "small_cap"
+    return "unknown"
+
+
+def _adjust_weights_for_market_cap(base_weights: dict, market_cap: float) -> dict:
+    """
+    Adjust signal weights based on market cap tier.
+
+    Rationale from backtest results:
+    - Large caps ($50B+): Momentum is anti-predictive. Lean on fundamentals
+      and earnings quality. These stocks are efficiently priced — only
+      genuine fundamental shifts move them.
+    - Mid caps ($2B-$50B): Sweet spot. Volume + momentum work well.
+      Balanced approach with slight volume boost.
+    - Small caps ($300M-$2B): Volume anomaly is strongest here because
+      institutional accumulation is hardest to hide in thinly-traded stocks.
+    """
+    tier = _get_market_cap_tier(market_cap)
+    weights = dict(base_weights)  # Copy
+
+    if tier == "large_cap":
+        # Shift from momentum → fundamentals + earnings quality
+        weights["momentum"] = weights.get("momentum", 13) * 0.6
+        weights["fundamentals"] = weights.get("fundamentals", 15) * 1.3
+        weights["earnings_quality"] = weights.get("earnings_quality", 11) * 1.3
+        weights["analyst_revisions"] = weights.get("analyst_revisions", 5) * 1.2
+
+    elif tier == "small_cap":
+        # Maximize volume anomaly — institutional accumulation is most
+        # visible in small caps with lower daily volume
+        weights["volume_anomaly"] = weights.get("volume_anomaly", 20) * 1.3
+        weights["momentum"] = weights.get("momentum", 13) * 1.1
+        weights["fundamentals"] = weights.get("fundamentals", 15) * 0.85
+
+    # mid_cap and unknown: use base weights as-is
+
+    # Re-normalize to sum to 100
+    total = sum(weights.values())
+    if total > 0:
+        weights = {k: round(v / total * 100, 1) for k, v in weights.items()}
+
+    return weights
 
 
 def classify_strategy(stock_result: dict, scored_result: dict) -> dict:

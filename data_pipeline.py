@@ -67,9 +67,10 @@ def _fetch_sp1500() -> list[str]:
 def _fetch_nasdaq_universe() -> list[str]:
     """
     Fetch all US-traded stocks from NASDAQ's official screener API.
-    Returns tickers for common stocks (filters out ETFs, warrants, etc).
+    Aggressively filters out non-common-stock securities.
     """
     import urllib.request
+    import re
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -92,26 +93,50 @@ def _fetch_nasdaq_universe() -> list[str]:
 
         for row in rows:
             symbol = row.get("symbol", "").strip()
+            name = row.get("name", "").lower()
             market_cap = row.get("marketCap", "")
 
-            # Skip blank symbols
             if not symbol:
                 continue
 
-            # Skip symbols with special characters (warrants, units, etc)
-            # Valid tickers: letters, possibly a hyphen (BRK-B), up to 5 chars
+            # --- Aggressive junk filtering ---
+
+            # Must be only letters + optional hyphen, max 5 chars
             if not all(c.isalpha() or c == "-" for c in symbol):
                 continue
             if len(symbol) > 5:
                 continue
 
-            # Skip if market cap is empty/zero (usually means it's not a real stock)
-            # NASDAQ returns market cap as a string like "1,234,567,890"
+            # Warrants end in W (BDCIW, BLZRW, etc)
+            if len(symbol) >= 4 and symbol.endswith("W"):
+                continue
+
+            # Units end in U (BIXIU, BPACU, etc)
+            if len(symbol) >= 4 and symbol.endswith("U"):
+                continue
+
+            # Rights end in R after 3+ base chars (BHAVR, BSAAR, etc)
+            if len(symbol) >= 4 and symbol.endswith("R") and symbol[-2].isalpha():
+                # Allow real tickers like ABBR by checking if base exists
+                # Simple heuristic: if 4+ chars and ends in R, likely a right
+                if len(symbol) >= 5:
+                    continue
+
+            # Preferred shares: tickers ending in P after 3+ chars (BPYPO, BHFAP, etc)
+            # Be careful not to filter BP, GAP, etc
+            if len(symbol) >= 5 and symbol[-1] in ("P", "O", "N") and symbol[-2].isalpha():
+                continue
+
+            # Filter by name keywords (closed-end funds, notes, debentures)
+            skip_names = ["warrant", "unit", "right", "debenture", "note ",
+                          "preferred", "acquisition corp", "blank check"]
+            if any(kw in name for kw in skip_names):
+                continue
+
+            # Market cap filter
             if market_cap:
                 try:
                     mcap_num = float(str(market_cap).replace(",", ""))
-                    # Our quality gate requires $300M, but we fetch down to $100M
-                    # to catch stocks approaching the threshold
                     if mcap_num < 100_000_000:
                         continue
                 except (ValueError, TypeError):
@@ -124,7 +149,6 @@ def _fetch_nasdaq_universe() -> list[str]:
     except Exception as e:
         logger.warning(f"NASDAQ API fetch failed: {e}")
 
-    # Fallback if NASDAQ API fails
     if len(tickers) < 50:
         logger.warning("NASDAQ API failed — using hardcoded fallback universe")
         tickers.update(FALLBACK_TICKERS)
@@ -219,7 +243,7 @@ def get_price_history(
 def get_price_history_batch(
     tickers: list[str],
     period: str = "1y",
-    batch_size: int = 50,
+    batch_size: int = 20,  # Reduced from 50 to prevent DNS overload
 ) -> dict[str, pd.DataFrame]:
     """
     Batch-download price data for efficiency.
@@ -240,6 +264,8 @@ def get_price_history_batch(
                 pass
         uncached.append(t)
 
+    logger.info(f"  {len(results)} from cache, {len(uncached)} to download")
+
     # Batch download uncached tickers
     for i in range(0, len(uncached), batch_size):
         batch = uncached[i:i + batch_size]
@@ -248,7 +274,7 @@ def get_price_history_batch(
                 batch,
                 period=period,
                 group_by="ticker",
-                threads=True,
+                threads=False,  # Disable threading to prevent DNS overload
                 progress=False,
             )
             for t in batch:
@@ -268,9 +294,9 @@ def get_price_history_batch(
         except Exception as e:
             logger.warning(f"Batch download failed for {batch[:3]}...: {e}")
 
-        # Rate limiting
+        # Rate limiting — 2s between batches to prevent DNS overload
         if i + batch_size < len(uncached):
-            time.sleep(1)
+            time.sleep(2)
 
     logger.info(
         f"Price data: {len(results)}/{len(tickers)} tickers loaded "
