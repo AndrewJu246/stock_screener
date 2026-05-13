@@ -176,12 +176,15 @@ def run_scan(
                     prefilter_skipped += 1
                     continue
 
-            # If both price-based signals are weak, skip expensive calls.
-            # A stock needs ≥2 signals at ≥50 to pass the quality gate.
-            # If volume AND momentum are both below 35, it would need
-            # ALL other signals to be high — extremely unlikely.
+            # REPLACE with:
             best_price_signal = max(pre_vol, pre_mom)
-            if best_price_signal < 30:
+
+            # Lower bar for potential small-caps — quiet stocks deserve a look
+            # Average volume < 500K suggests a smaller, less-followed company
+            avg_vol_20d = hist["Volume"].iloc[-20:].mean() if len(hist) >= 20 else 0
+            threshold = 15 if avg_vol_20d < 500_000 else 30
+
+            if best_price_signal < threshold:
                 prefilter_skipped += 1
                 continue
 

@@ -27,15 +27,16 @@ REGIMES = {
     "bull": {
         "description": "Strong uptrend — volume-driven accumulation + sector flows",
         "weights": {
-            "volume_anomaly":    20,  # Backtest: strongest signal (+3.5% 30d, +8% 60d edge)
-            "momentum":          16,  # Backtest: positive but weak edge (+0.9%)
-            "fundamentals":      12,  # Not backtested yet — keep moderate
-            "smart_money":       10,  # Not backtested yet — keep moderate
-            "sector_rotation":   12,  # Correlated with megatrend
-            "earnings_quality":   8,  # Quality filter, important
-            "analyst_revisions":  5,  # Showed overextension issues
-            "tech_megatrend":    10,  # Key for finding breakout sectors
-            "relative_strength":  7,  # Backtest: weak but positive edge (+0.5%)
+            "volume_anomaly":      17,
+            "momentum":            14,
+            "fundamentals":        10,
+            "smart_money":          9,
+            "sector_rotation":     10,
+            "earnings_quality":     7,
+            "analyst_revisions":    4,
+            "tech_megatrend":       8,
+            "relative_strength":    6,
+            "discovery_potential": 15,  # Core thesis: find undiscovered stocks
         },
         "conditions": {
             "sp500_above_200dma": True,
@@ -46,15 +47,16 @@ REGIMES = {
     "bear": {
         "description": "Downturn / uncertainty — fundamentals + volume confirmation",
         "weights": {
-            "volume_anomaly":    15,  # Still strongest backtested signal
-            "momentum":           5,
-            "fundamentals":      22,  # Dominant in downturns
-            "smart_money":       18,  # Insider conviction matters most here
-            "sector_rotation":    5,
-            "earnings_quality":  18,  # Cash flow is king in bear markets
-            "analyst_revisions":  4,
-            "tech_megatrend":     5,
-            "relative_strength":  8,  # Finding relative outperformers
+            "volume_anomaly":      13,
+            "momentum":             4,
+            "fundamentals":        19,
+            "smart_money":         15,
+            "sector_rotation":      4,
+            "earnings_quality":    15,
+            "analyst_revisions":    3,
+            "tech_megatrend":       4,
+            "relative_strength":    7,
+            "discovery_potential": 16,
         },
         "conditions": {
             "sp500_above_200dma": False,
@@ -65,15 +67,16 @@ REGIMES = {
     "early_recovery": {
         "description": "Recovery — volume spikes + fundamentals confirm the turn",
         "weights": {
-            "volume_anomaly":    20,  # Volume spikes signal recovery leaders
-            "momentum":          12,
-            "fundamentals":      16,
-            "smart_money":       14,
-            "sector_rotation":    8,
-            "earnings_quality":  10,
-            "analyst_revisions":  5,
-            "tech_megatrend":     8,
-            "relative_strength":  7,
+            "volume_anomaly":      17,
+            "momentum":            10,
+            "fundamentals":        14,
+            "smart_money":         12,
+            "sector_rotation":      7,
+            "earnings_quality":     8,
+            "analyst_revisions":    4,
+            "tech_megatrend":       7,
+            "relative_strength":    6,
+            "discovery_potential": 15,
         },
         "conditions": {
             "sp500_above_200dma": False,
@@ -84,15 +87,16 @@ REGIMES = {
     "balanced": {
         "description": "Default / benchmark — volume-led with broad support",
         "weights": {
-            "volume_anomaly":    20,  # Backtest-validated as top signal
-            "momentum":          13,
-            "fundamentals":      15,
-            "smart_money":       12,
-            "sector_rotation":    8,
-            "earnings_quality":  11,
-            "analyst_revisions":  5,
-            "tech_megatrend":     9,
-            "relative_strength":  7,
+            "volume_anomaly":      17,
+            "momentum":            11,
+            "fundamentals":        13,
+            "smart_money":         10,
+            "sector_rotation":      7,
+            "earnings_quality":     9,
+            "analyst_revisions":    4,
+            "tech_megatrend":       8,
+            "relative_strength":    6,
+            "discovery_potential": 15,
         },
         "conditions": {},  # Fallback — always available
     },

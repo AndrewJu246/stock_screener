@@ -1,21 +1,22 @@
 """
-FinBERT news sentiment analysis.
+FinBERT news sentiment analysis via Hugging Face Inference API.
 
-Scores recent financial news headlines for each stock using
-ProsusAI/finbert, a BERT model fine-tuned on financial text.
+Scores recent financial news headlines using ProsusAI/finbert
+through the HF API — no local PyTorch or model download needed.
 
-Sentiment categories: positive, negative, neutral
-The aggregate sentiment becomes a signal modifier.
+Setup:
+    1. Create free account at huggingface.co
+    2. Get API token from huggingface.co/settings/tokens
+    3. Set environment variable: export HF_API_TOKEN=hf_xxxxx
+       Or create a file: echo "hf_xxxxx" > .hf_token
 
-Requirements:
-    pip install transformers torch
-
-If transformers/torch aren't installed, this module gracefully
-skips and returns neutral scores.
+Free tier: ~30,000 characters/month (plenty for daily scans).
 """
 
 import json
 import logging
+import os
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -25,49 +26,57 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Check if FinBERT dependencies are available
-_FINBERT_AVAILABLE = False
-_sentiment_pipeline = None
-
-try:
-    from transformers import pipeline as hf_pipeline
-    _FINBERT_AVAILABLE = True
-except ImportError:
-    logger.info(
-        "FinBERT not available — install with: pip install transformers torch\n"
-        "Sentiment analysis will be skipped."
-    )
+HF_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+TOKEN_FILE = Path(".hf_token")
 
 
-def _get_pipeline():
-    """Lazy-load the FinBERT pipeline (downloads model on first use)."""
-    global _sentiment_pipeline
-    if _sentiment_pipeline is None and _FINBERT_AVAILABLE:
-        try:
-            logger.info("Loading FinBERT model (first time may take a minute)...")
-            _sentiment_pipeline = hf_pipeline(
-                "sentiment-analysis",
-                model="ProsusAI/finbert",
-                tokenizer="ProsusAI/finbert",
-            )
-            logger.info("FinBERT loaded successfully")
-        except Exception as e:
-            logger.warning(f"Failed to load FinBERT: {e}")
-            return None
-    return _sentiment_pipeline
+def _get_hf_token() -> Optional[str]:
+    """Get HuggingFace API token from env var or file."""
+    token = os.environ.get("HF_API_TOKEN")
+    if token:
+        return token.strip()
+
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+
+    return None
+
+
+def _query_finbert(texts: list[str]) -> Optional[list]:
+    """Send texts to HuggingFace Inference API for sentiment analysis."""
+    token = _get_hf_token()
+
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    payload = json.dumps({"inputs": texts}).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(HF_API_URL, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            logger.debug("FinBERT model is loading on HF — will retry next scan")
+        elif e.code == 401:
+            logger.warning("HF API token invalid — set HF_API_TOKEN or create .hf_token file")
+        else:
+            logger.debug(f"HF API error {e.code}: {e.reason}")
+        return None
+    except Exception as e:
+        logger.debug(f"HF API request failed: {e}")
+        return None
 
 
 def get_news_headlines(ticker: str, days_back: int = 7) -> list[str]:
-    """
-    Get recent news headlines for a ticker from yfinance.
-    Returns list of headline strings.
-    """
+    """Get recent news headlines for a ticker from yfinance."""
     cache_file = CACHE_DIR / f"news_{ticker}.json"
 
     if cache_file.exists():
         mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
         age = (datetime.now() - mtime).total_seconds() / 3600
-        if age < 12:  # Cache for 12 hours
+        if age < 12:
             try:
                 with open(cache_file) as f:
                     return json.load(f)
@@ -83,25 +92,15 @@ def get_news_headlines(ticker: str, days_back: int = 7) -> list[str]:
             return []
 
         headlines = []
-        cutoff = datetime.now() - timedelta(days=days_back)
-
         for article in news:
             title = article.get("title", "")
-            pub_time = article.get("providerPublishTime", 0)
-
-            if pub_time:
-                pub_date = datetime.fromtimestamp(pub_time)
-                if pub_date < cutoff:
-                    continue
-
             if title:
                 headlines.append(title)
 
-        # Cache
         with open(cache_file, "w") as f:
-            json.dump(headlines, f)
+            json.dump(headlines[:20], f)
 
-        return headlines
+        return headlines[:20]
 
     except Exception as e:
         logger.debug(f"Failed to get news for {ticker}: {e}")
@@ -110,11 +109,11 @@ def get_news_headlines(ticker: str, days_back: int = 7) -> list[str]:
 
 def analyze_sentiment(ticker: str, headlines: list[str] = None) -> dict:
     """
-    Analyze sentiment of recent news headlines using FinBERT.
+    Analyze sentiment of recent news headlines using FinBERT via HF API.
 
     Returns: {
         "sentiment": "positive" | "negative" | "neutral" | "unavailable",
-        "score": float (-1 to 1, negative=bearish, positive=bullish),
+        "score": float (-1 to 1),
         "score_modifier": float (-10 to +10),
         "num_headlines": int,
         "breakdown": {"positive": n, "negative": n, "neutral": n},
@@ -134,39 +133,45 @@ def analyze_sentiment(ticker: str, headlines: list[str] = None) -> dict:
             "detail": "No recent news found",
         }
 
-    if not _FINBERT_AVAILABLE:
-        return {
-            "sentiment": "unavailable",
-            "score": 0,
-            "score_modifier": 0,
-            "num_headlines": len(headlines),
-            "breakdown": {},
-            "detail": "FinBERT not installed — run: pip install transformers torch",
-        }
+    # Check sentiment cache
+    cache_file = CACHE_DIR / f"sentiment_{ticker}.json"
+    if cache_file.exists():
+        mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+        age = (datetime.now() - mtime).total_seconds() / 3600
+        if age < 12:
+            try:
+                with open(cache_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
 
-    pipe = _get_pipeline()
-    if pipe is None:
+    # Query HF API
+    truncated = [h[:512] for h in headlines[:15]]
+    results = _query_finbert(truncated)
+
+    if results is None:
         return {
             "sentiment": "unavailable",
             "score": 0,
             "score_modifier": 0,
             "num_headlines": len(headlines),
             "breakdown": {},
-            "detail": "FinBERT failed to load",
+            "detail": "HF API unavailable — check token or try later",
         }
 
     try:
-        # Score each headline
-        # Truncate long headlines to avoid tokenizer issues
-        truncated = [h[:512] for h in headlines[:20]]  # Max 20 headlines
-        results = pipe(truncated)
-
         breakdown = {"positive": 0, "negative": 0, "neutral": 0}
         weighted_score = 0
+        num = 0
 
         for result in results:
-            label = result["label"].lower()
-            confidence = result["score"]
+            if not isinstance(result, list):
+                continue
+
+            # Each result is a list of {label, score} dicts
+            best = max(result, key=lambda x: x.get("score", 0))
+            label = best.get("label", "neutral").lower()
+            confidence = best.get("score", 0)
 
             if label in breakdown:
                 breakdown[label] += 1
@@ -175,13 +180,21 @@ def analyze_sentiment(ticker: str, headlines: list[str] = None) -> dict:
                 weighted_score += confidence
             elif label == "negative":
                 weighted_score -= confidence
-            # neutral contributes 0
 
-        # Normalize to -1 to +1
-        num = len(results)
-        avg_score = weighted_score / num if num > 0 else 0
+            num += 1
 
-        # Determine overall sentiment
+        if num == 0:
+            return {
+                "sentiment": "neutral",
+                "score": 0,
+                "score_modifier": 0,
+                "num_headlines": len(headlines),
+                "breakdown": breakdown,
+                "detail": "Could not parse sentiment results",
+            }
+
+        avg_score = weighted_score / num
+
         if avg_score > 0.15:
             sentiment = "positive"
         elif avg_score < -0.15:
@@ -189,27 +202,29 @@ def analyze_sentiment(ticker: str, headlines: list[str] = None) -> dict:
         else:
             sentiment = "neutral"
 
-        # Score modifier: scale to -10 to +10
-        score_modifier = round(avg_score * 10, 1)
-        score_modifier = max(-10, min(10, score_modifier))
+        score_modifier = round(max(-10, min(10, avg_score * 10)), 1)
 
-        detail = (
-            f"News sentiment: {sentiment} ({avg_score:+.2f}) — "
-            f"{breakdown['positive']}↑ {breakdown['negative']}↓ {breakdown['neutral']}→ "
-            f"from {num} headlines"
-        )
-
-        return {
+        result = {
             "sentiment": sentiment,
             "score": round(avg_score, 3),
             "score_modifier": score_modifier,
             "num_headlines": num,
             "breakdown": breakdown,
-            "detail": detail,
+            "detail": (
+                f"News sentiment: {sentiment} ({avg_score:+.2f}) — "
+                f"{breakdown['positive']}↑ {breakdown['negative']}↓ {breakdown['neutral']}→ "
+                f"from {num} headlines"
+            ),
         }
 
+        # Cache result
+        with open(cache_file, "w") as f:
+            json.dump(result, f)
+
+        return result
+
     except Exception as e:
-        logger.warning(f"FinBERT analysis failed for {ticker}: {e}")
+        logger.warning(f"FinBERT parsing failed for {ticker}: {e}")
         return {
             "sentiment": "unavailable",
             "score": 0,
@@ -221,5 +236,5 @@ def analyze_sentiment(ticker: str, headlines: list[str] = None) -> dict:
 
 
 def is_available() -> bool:
-    """Check if FinBERT is ready to use."""
-    return _FINBERT_AVAILABLE
+    """Check if FinBERT API is configured."""
+    return _get_hf_token() is not None

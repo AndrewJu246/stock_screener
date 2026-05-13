@@ -21,6 +21,7 @@ import pandas as pd
 from typing import Optional
 
 from config import SIGNAL_PARAMS, MEGATRENDS
+from discovery_signal import discovery_potential_score
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -598,6 +599,7 @@ def compute_all_signals(
         "analyst_revisions": analyst_revisions_score(financials),
         "tech_megatrend": tech_megatrend_score(financials, sector_etf_momentum),
         "relative_strength": relative_strength_score(stock_return_3m, sector_median_return),
+        "discovery_potential": discovery_potential_score(financials, institutional, hist),
     }
 
     # Volatility (for quality gate)
