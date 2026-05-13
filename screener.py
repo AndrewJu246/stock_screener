@@ -280,6 +280,71 @@ def run_scan(
     for i, r in enumerate(top_candidates):
         r["rank"] = i + 1
 
+    # ── Step 7a: Enhance top candidates with additional signals ───────
+    # These run only on the top candidates (not all 2000+ stocks) for speed.
+    logger.info(f"Enhancing top {len(top_candidates)} candidates...")
+
+    for candidate in top_candidates:
+        ticker = candidate["ticker"]
+        signals = candidate.get("signals", {})
+
+        # SEC EDGAR: enhance insider signal
+        try:
+            from sec_edgar import enhance_insider_signal
+            insider_score = signals.get("smart_money", {}).get("score", 50)
+            edgar = enhance_insider_signal(ticker, insider_score)
+            candidate["sec_edgar"] = edgar
+        except Exception:
+            pass
+
+        # Short interest: assess squeeze potential or warning
+        try:
+            from short_interest import assess_short_interest
+            fund_score = signals.get("fundamentals", {}).get("score", 50)
+            insider_score = signals.get("smart_money", {}).get("score", 50)
+            short = assess_short_interest(ticker, fund_score, insider_score)
+            candidate["short_interest"] = short
+            # Apply score modifier
+            modifier = short.get("score_modifier", 0)
+            if modifier != 0:
+                candidate["composite_score"] = round(
+                    candidate["composite_score"] + modifier, 2
+                )
+        except Exception:
+            pass
+
+        # FinBERT news sentiment
+        try:
+            from finbert_sentiment import analyze_sentiment, is_available
+            if is_available():
+                sentiment = analyze_sentiment(ticker)
+                candidate["news_sentiment"] = sentiment
+                modifier = sentiment.get("score_modifier", 0)
+                if modifier != 0:
+                    candidate["composite_score"] = round(
+                        candidate["composite_score"] + modifier, 2
+                    )
+        except Exception:
+            pass
+
+        # ML prediction (auto-trains when enough data exists)
+        try:
+            from ml_layer import predict_score, auto_check_and_train
+            if candidate == top_candidates[0]:  # Only check once
+                auto_check_and_train()
+            ml = predict_score(
+                {s: d.get("score", 0) for s, d in signals.items() if isinstance(d, dict)}
+            )
+            if ml:
+                candidate["ml_prediction"] = ml
+        except Exception:
+            pass
+
+    # Re-sort after score modifiers
+    top_candidates.sort(key=lambda x: x["composite_score"], reverse=True)
+    for i, r in enumerate(top_candidates):
+        r["rank"] = i + 1
+
     # ── Step 7b: Diversification guard ────────────────────────────────
     try:
         from diversifier import diversify_candidates
