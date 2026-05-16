@@ -30,10 +30,16 @@ from config import REGIMES, SIGNAL_PARAMS, QUALITY_GATE
 from signals import (
     volume_anomaly_score,
     momentum_score,
+    fundamentals_score,
+    smart_money_score,
+    sector_rotation_score,
     earnings_quality_score,
+    analyst_revisions_score,
+    tech_megatrend_score,
     relative_strength_score,
     volatility_ratio,
 )
+from discovery_signal import discovery_potential_score
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +71,11 @@ def run_backtest(
 
     This tells us which signals actually predicted positive returns.
     """
-    from data_pipeline import get_price_history, get_universe
+    from data_pipeline import (
+        get_price_history, get_universe, get_financials,
+        get_insider_transactions, get_institutional_holders,
+        get_sector_etf_momentum,
+    )
 
     start_time = time.time()
 
@@ -74,7 +84,6 @@ def run_backtest(
         universe = tickers
     else:
         universe = get_universe()
-        # For full backtest, use a random sample to keep it tractable
         if len(universe) > 200:
             import random
             random.seed(42)
@@ -83,9 +92,13 @@ def run_backtest(
 
     logger.info(f"Backtesting {len(universe)} tickers over {years} years...")
 
-    period = f"{years + 1}y"  # Extra year for lookback data
+    period = f"{years + 1}y"
     end_date = datetime.now()
     start_date = end_date - timedelta(days=years * 365)
+
+    # Fetch sector ETF momentum once (current snapshot used as proxy)
+    logger.info("Fetching sector ETF momentum for backtest...")
+    sector_etf_momentum = get_sector_etf_momentum()
 
     all_observations = []
     processed = 0
@@ -96,23 +109,36 @@ def run_backtest(
 
         try:
             hist = get_price_history(ticker, period=period)
-            if hist is None or len(hist) < 252:  # Need at least 1 year of data
+            if hist is None or len(hist) < 252:
                 continue
+
+            # Fetch fundamental data once per ticker (current snapshot)
+            # Not a perfect historical backtest, but validates whether
+            # fundamental quality correlates with forward returns
+            financials = get_financials(ticker)
+            insider_txns = get_insider_transactions(ticker) or []
+            institutional = get_institutional_holders(ticker) or []
+            sector = financials.get("sector", "Unknown") if financials else "Unknown"
 
             close = hist["Close"].values.astype(float)
             dates = hist.index
 
-            # Walk through time at regular intervals
-            # Start from 252 days in (need lookback) and stop 90 days from end (need forward data)
+            # Pre-compute fundamental-based signals once (static per ticker)
+            fund_result = fundamentals_score(financials)
+            eq_result = earnings_quality_score(financials)
+            analyst_result = analyst_revisions_score(financials)
+            smart_result = smart_money_score(insider_txns, institutional)
+            sector_rot_result = sector_rotation_score(sector, sector_etf_momentum)
+            megatrend_result = tech_megatrend_score(financials, sector_etf_momentum)
+            discovery_result = discovery_potential_score(financials, institutional, hist)
+
             for j in range(252, len(hist) - 90, sample_interval_days):
-                # Use only data up to this point (no future leakage)
                 hist_slice = hist.iloc[:j + 1]
 
-                # Compute price-based signals
+                # Price-based signals (vary with time)
                 vol_result = volume_anomaly_score(hist_slice)
                 mom_result = momentum_score(hist_slice)
 
-                # Relative strength (simplified — use stock's own 3m return vs 0)
                 close_at_j = close[j]
                 if j >= 63 and close[j - 63] > 0:
                     ret_3m = (close_at_j - close[j - 63]) / close[j - 63]
@@ -120,18 +146,22 @@ def run_backtest(
                     ret_3m = 0
                 rs_result = relative_strength_score(ret_3m, 0)
 
-                # Volatility
                 vol_pct = volatility_ratio(hist_slice)
 
-                # Determine which signals are "high"
                 signals = {
                     "volume_anomaly": vol_result.get("score", 0),
                     "momentum": mom_result.get("score", 0),
                     "relative_strength": rs_result.get("score", 0),
+                    "fundamentals": fund_result.get("score", 0),
+                    "earnings_quality": eq_result.get("score", 0),
+                    "analyst_revisions": analyst_result.get("score", 0),
+                    "smart_money": smart_result.get("score", 0),
+                    "sector_rotation": sector_rot_result.get("score", 0),
+                    "tech_megatrend": megatrend_result.get("score", 0),
+                    "discovery_potential": discovery_result.get("score", 0),
                 }
                 high_signals = [s for s, v in signals.items() if v >= SIGNAL_THRESHOLD]
 
-                # Compute forward returns (this is what we're predicting)
                 forward_returns = {}
                 for window in EVAL_WINDOWS:
                     if j + window < len(close) and close_at_j > 0:
@@ -142,7 +172,6 @@ def run_backtest(
                     else:
                         forward_returns[window] = None
 
-                # Skip if we don't have at least 30-day forward data
                 if forward_returns.get(30) is None:
                     continue
 
@@ -150,6 +179,7 @@ def run_backtest(
                     "ticker": ticker,
                     "date": str(dates[j].date()) if hasattr(dates[j], 'date') else str(dates[j])[:10],
                     "price": round(close_at_j, 2),
+                    "sector": sector,
                     "signals": signals,
                     "high_signals": high_signals,
                     "volatility_pct": round(vol_pct, 4) if vol_pct else None,
@@ -202,9 +232,13 @@ def analyze_backtest(observations: list[dict]) -> dict:
         "by_volatility": {},
     }
 
-    SIGNAL_NAMES = ["volume_anomaly", "momentum", "relative_strength"]
+    SIGNAL_NAMES = [
+        "volume_anomaly", "momentum", "relative_strength",
+        "fundamentals", "earnings_quality", "analyst_revisions",
+        "smart_money", "sector_rotation", "tech_megatrend",
+        "discovery_potential",
+    ]
 
-    # ── Overall baseline ──────────────────────────────────────────────
     all_30d = [o["forward_returns"][30] for o in observations if o["forward_returns"].get(30) is not None]
     if all_30d:
         analysis["overall"] = {

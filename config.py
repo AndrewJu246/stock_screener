@@ -7,7 +7,7 @@ All thresholds, weights, and parameters in one place.
 # Start with S&P 500 + MidCap 400 + SmallCap 600 ≈ 1500 stocks.
 # We fetch the actual tickers at runtime from Wikipedia/yfinance.
 # Set to "full" to scan all ~8000 US-listed stocks.
-UNIVERSE_MODE = "sp1500"  # "sp1500" or "full"
+UNIVERSE_MODE = "full"  # "sp1500" or "full"
 
 # ─── Quality gate thresholds ─────────────────────────────────────────
 QUALITY_GATE = {
@@ -25,18 +25,18 @@ QUALITY_GATE = {
 # Each regime defines signal weights (must sum to 100).
 REGIMES = {
     "bull": {
-        "description": "Strong uptrend — volume-driven accumulation + sector flows",
+        "description": "Strong uptrend — sector flows + volume confirmation",
         "weights": {
-            "volume_anomaly":      17,
-            "momentum":            14,
+            "volume_anomaly":      15,  # Validated: +1.84% edge at 30d
+            "momentum":             8,  # Reduced: no edge, momentum-chasing risk
             "fundamentals":        10,
-            "smart_money":          9,
-            "sector_rotation":     10,
+            "smart_money":         10,
+            "sector_rotation":     18,  # Boosted: strongest clean edge (+6.37% at 90d)
             "earnings_quality":     7,
-            "analyst_revisions":    4,
-            "tech_megatrend":       8,
-            "relative_strength":    6,
-            "discovery_potential": 15,  # Core thesis: find undiscovered stocks
+            "analyst_revisions":    6,
+            "tech_megatrend":      10,  # Clean signal, positive at 60d/90d
+            "relative_strength":    4,  # Reduced: negative edge, correlated w/ momentum
+            "discovery_potential": 12,  # Core thesis — trimmed pending forward validation
         },
         "conditions": {
             "sp500_above_200dma": True,
@@ -45,18 +45,18 @@ REGIMES = {
         },
     },
     "bear": {
-        "description": "Downturn / uncertainty — fundamentals + volume confirmation",
+        "description": "Downturn / uncertainty — fundamentals + smart money + quality",
         "weights": {
             "volume_anomaly":      13,
             "momentum":             4,
-            "fundamentals":        19,
-            "smart_money":         15,
-            "sector_rotation":      4,
-            "earnings_quality":    15,
-            "analyst_revisions":    3,
-            "tech_megatrend":       4,
-            "relative_strength":    7,
-            "discovery_potential": 16,
+            "fundamentals":        18,  # Quality matters most in downturn
+            "smart_money":         16,  # Insider buying in bear = strongest signal
+            "sector_rotation":      8,  # Boosted: edge persists across regimes
+            "earnings_quality":    14,
+            "analyst_revisions":    4,
+            "tech_megatrend":       5,
+            "relative_strength":    5,  # Trimmed: negative edge
+            "discovery_potential": 13,  # Trimmed pending forward validation
         },
         "conditions": {
             "sp500_above_200dma": False,
@@ -65,18 +65,18 @@ REGIMES = {
         },
     },
     "early_recovery": {
-        "description": "Recovery — volume spikes + fundamentals confirm the turn",
+        "description": "Recovery — sector turns + volume spikes confirm the bottom",
         "weights": {
-            "volume_anomaly":      17,
-            "momentum":            10,
-            "fundamentals":        14,
+            "volume_anomaly":      16,  # Accumulation in recovery
+            "momentum":             7,  # Reduced: chase risk
+            "fundamentals":        13,
             "smart_money":         12,
-            "sector_rotation":      7,
+            "sector_rotation":     14,  # Boosted: catching sector turns is key
             "earnings_quality":     8,
-            "analyst_revisions":    4,
-            "tech_megatrend":       7,
-            "relative_strength":    6,
-            "discovery_potential": 15,
+            "analyst_revisions":    6,
+            "tech_megatrend":       8,
+            "relative_strength":    4,  # Trimmed: negative edge
+            "discovery_potential": 12,  # Trimmed pending forward validation
         },
         "conditions": {
             "sp500_above_200dma": False,
@@ -85,18 +85,18 @@ REGIMES = {
         },
     },
     "balanced": {
-        "description": "Default / benchmark — volume-led with broad support",
+        "description": "Default / benchmark — sector flows + volume with broad support",
         "weights": {
-            "volume_anomaly":      17,
-            "momentum":            11,
-            "fundamentals":        13,
+            "volume_anomaly":      15,  # Validated
+            "momentum":             8,  # Reduced: no edge
+            "fundamentals":        12,
             "smart_money":         10,
-            "sector_rotation":      7,
-            "earnings_quality":     9,
-            "analyst_revisions":    4,
-            "tech_megatrend":       8,
-            "relative_strength":    6,
-            "discovery_potential": 15,
+            "sector_rotation":     15,  # Boosted: strongest clean edge
+            "earnings_quality":     8,
+            "analyst_revisions":    6,
+            "tech_megatrend":       9,
+            "relative_strength":    5,  # Trimmed: negative edge
+            "discovery_potential": 12,  # Core thesis — pending forward validation
         },
         "conditions": {},  # Fallback — always available
     },

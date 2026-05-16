@@ -176,13 +176,18 @@ def run_scan(
                     prefilter_skipped += 1
                     continue
 
-            # REPLACE with:
             best_price_signal = max(pre_vol, pre_mom)
 
-            # Lower bar for potential small-caps — quiet stocks deserve a look
-            # Average volume < 500K suggests a smaller, less-followed company
             avg_vol_20d = hist["Volume"].iloc[-20:].mean() if len(hist) >= 20 else 0
-            threshold = 15 if avg_vol_20d < 500_000 else 30
+
+            # Tiered thresholds: under-followed stocks get a much lower bar
+            # because they're prime discovery candidates (the whole thesis)
+            if avg_vol_20d < 200_000:
+                threshold = 5
+            elif avg_vol_20d < 500_000:
+                threshold = 12
+            else:
+                threshold = 25
 
             if best_price_signal < threshold:
                 prefilter_skipped += 1
