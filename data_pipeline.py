@@ -70,12 +70,16 @@ def _fetch_nasdaq_universe() -> list[str]:
     Aggressively filters out non-common-stock securities.
     """
     import urllib.request
+    import ssl
+    import certifi
     import re
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Accept": "application/json",
     }
+
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
     tickers = set()
 
@@ -85,7 +89,7 @@ def _fetch_nasdaq_universe() -> list[str]:
             "?tableType=traded&limit=10000&offset=0"
         )
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
 
         rows = raw.get("data", {}).get("table", {}).get("rows", [])
