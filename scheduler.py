@@ -154,23 +154,94 @@ def generate_digest(scan_results: dict = None) -> str:
                 lines.append(f"       {c['strategy'].get('reasoning', '')}")
                 lines.append("")
 
-    # Tracker status
+    # Tracker status (deduped by ticker)
     tracker_file = Path("tracker_data/predictions.json")
     if tracker_file.exists():
         with open(tracker_file) as f:
             predictions = json.load(f)
         active = [p for p in predictions if p["status"] == "active"]
         if active:
+            # Deduplicate: group by ticker, use first entry date
+            ticker_groups = {}
+            for p in active:
+                t = p["ticker"]
+                if t not in ticker_groups:
+                    ticker_groups[t] = []
+                ticker_groups[t].append(p)
+
+            deduped = []
+            for ticker, preds in ticker_groups.items():
+                sorted_preds = sorted(preds, key=lambda x: x["entry_date"])
+                first = sorted_preds[0]
+                latest = sorted_preds[-1]
+                entry_price = first.get("entry_price", 0)
+                current_price = latest.get("current_price", 0)
+                ret = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                deduped.append({
+                    "ticker": ticker,
+                    "return": ret,
+                    "peak": max(p.get("peak_return", 0) for p in preds),
+                    "days": max(p.get("days_tracked", 0) for p in preds),
+                    "flagged": len(preds),
+                    "strategy": first.get("strategy", ""),
+                })
+
+            winners = [d for d in deduped if d["return"] > 0]
+            avg_ret = sum(d["return"] for d in deduped) / len(deduped) if deduped else 0
+
             lines.append(f"{'─'*60}")
-            lines.append(f"TRACKING {len(active)} ACTIVE PREDICTIONS:")
+            lines.append(f"PREDICTION TRACKER ({len(deduped)} unique stocks, {len(active)} total predictions):")
             lines.append(f"{'─'*60}")
-            lines.append(f"{'Ticker':<8} {'Days':<6} {'Return':>8} {'Peak':>8} {'Strategy':<18}")
-            for p in sorted(active, key=lambda x: x.get("current_return", 0), reverse=True)[:10]:
+            lines.append(f"  Avg return: {avg_ret:+.2%}  |  Win rate: {len(winners)}/{len(deduped)} ({len(winners)/len(deduped)*100:.0f}%)")
+            lines.append("")
+            lines.append(f"{'Ticker':<8} {'Return':>8} {'Peak':>8} {'Days':>5} {'Flagged':>7} {'Strategy':<18}")
+            for d in sorted(deduped, key=lambda x: x["return"], reverse=True)[:10]:
+                flag_str = f"{d['flagged']}x" if d["flagged"] > 1 else ""
                 lines.append(
-                    f"  {p['ticker']:<8} {p.get('days_tracked', 0):<6} "
-                    f"{p.get('current_return', 0):>+7.2%} "
-                    f"{p.get('peak_return', 0):>+7.2%} "
-                    f"{p.get('strategy', ''):<18}"
+                    f"  {d['ticker']:<8} {d['return']:>+7.2%} "
+                    f"{d['peak']:>+7.2%} "
+                    f"{d['days']:>5} "
+                    f"{flag_str:>7} "
+                    f"{d['strategy']:<18}"
+                )
+
+    # Paper trading summary
+    paper_file = Path("paper_trading/portfolio.json")
+    if paper_file.exists():
+        with open(paper_file) as f:
+            paper = json.load(f)
+        initial = paper.get("initial_capital", 10000)
+        cash = paper.get("cash", 0)
+        positions = paper.get("positions", {})
+        pos_value = sum(
+            p.get("current_value", p.get("cost_basis", 0))
+            for p in positions.values()
+        )
+        total_val = cash + pos_value
+        total_ret = (total_val - initial) / initial if initial > 0 else 0
+        realized = paper.get("total_realized_pnl", 0)
+        total_trades = paper.get("total_trades", 0)
+
+        lines.append("")
+        lines.append(f"{'─'*60}")
+        lines.append("PAPER PORTFOLIO:")
+        lines.append(f"{'─'*60}")
+        lines.append(f"  Value: ${total_val:,.2f} ({total_ret:+.2%})  |  Cash: ${cash:,.2f}")
+        lines.append(f"  Positions: {len(positions)}  |  Closed trades: {total_trades}  |  Realized P&L: ${realized:+,.2f}")
+
+        if positions:
+            lines.append("")
+            lines.append(f"  {'Ticker':<8} {'P&L%':>7} {'Entry':>8} {'Current':>8} {'Strategy':<18}")
+            for ticker, pos in sorted(
+                positions.items(),
+                key=lambda x: x[1].get("unrealized_pnl_pct", 0),
+                reverse=True,
+            ):
+                lines.append(
+                    f"  {ticker:<8} {pos.get('unrealized_pnl_pct', 0):>+6.2%} "
+                    f"${pos.get('entry_price', 0):>7.2f} "
+                    f"${pos.get('current_price', 0):>7.2f} "
+                    f"{pos.get('strategy', ''):<18}"
                 )
 
     lines.append(f"\n{'='*60}")

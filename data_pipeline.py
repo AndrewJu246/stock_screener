@@ -11,7 +11,7 @@ import json
 import os
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -222,13 +222,11 @@ def get_price_history(
     """
     cache_file = CACHE_DIR / f"price_{ticker}.parquet"
 
-    if use_cache and cache_file.exists():
-        age = _cache_age_hours(cache_file)
-        if age is not None and age < 18:  # Refresh after market close
-            try:
-                return pd.read_parquet(cache_file)
-            except Exception:
-                pass
+    if use_cache and _price_cache_is_current(cache_file):
+        try:
+            return pd.read_parquet(cache_file)
+        except Exception:
+            pass
 
     try:
         stock = yf.Ticker(ticker)
@@ -256,11 +254,10 @@ def get_price_history_batch(
     results = {}
     uncached = []
 
-    # Check cache first
+    # Check cache first (date-aware: valid if written after most recent market close)
     for t in tickers:
         cache_file = CACHE_DIR / f"price_{t}.parquet"
-        age = _cache_age_hours(cache_file)
-        if age is not None and age < 18:
+        if _price_cache_is_current(cache_file):
             try:
                 results[t] = pd.read_parquet(cache_file)
                 continue
@@ -563,6 +560,45 @@ def _cache_age_hours(path: Path) -> Optional[float]:
         return None
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     return (datetime.now() - mtime).total_seconds() / 3600
+
+
+def _most_recent_market_close() -> datetime:
+    """
+    Return the datetime of the most recent expected market close.
+
+    Markets close at 4 PM ET = 1 PM PT. We add a 30-min buffer
+    so yfinance has time to publish the day's bar.
+
+    - On a weekday after 1:30 PM PT: today's close
+    - Otherwise: most recent prior weekday's close
+    """
+    now = datetime.now()
+    close_time = dt_time(13, 30)  # 1:30 PM PT (post-close + buffer)
+
+    if now.weekday() < 5 and now.time() >= close_time:
+        return datetime.combine(now.date(), close_time)
+
+    # Walk back to the most recent weekday
+    candidate = now.date()
+    while True:
+        candidate = candidate - timedelta(days=1)
+        if candidate.weekday() < 5:
+            break
+    return datetime.combine(candidate, close_time)
+
+
+def _price_cache_is_current(cache_file: Path) -> bool:
+    """
+    Date-aware cache check: cache is valid if it was written
+    after the most recent expected market close. This means:
+      - Same-day reruns hit cache
+      - Daily scans after a new trading day's close refresh
+      - Weekend/holiday runs hit cache (no new data anyway)
+    """
+    if not cache_file.exists():
+        return False
+    mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+    return mtime >= _most_recent_market_close()
 
 
 def clear_cache(older_than_hours: int = 0):
