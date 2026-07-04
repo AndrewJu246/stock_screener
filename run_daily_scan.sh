@@ -39,7 +39,7 @@ echo "Scan started: $(date)" >> "$LOG_FILE"
 echo "========================================" >> "$LOG_FILE"
 
 # Run the full scan via scheduler.py with email digest
-"$VENV_PYTHON" scheduler.py --capital 10000 --email andrewjulolr10@gmail.com >> "$LOG_FILE" 2>&1
+caffeinate -i "$VENV_PYTHON" scheduler.py --capital 10000 --email andrewjulolr10@gmail.com >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 echo "" >> "$LOG_FILE"

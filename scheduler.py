@@ -159,7 +159,8 @@ def generate_digest(scan_results: dict = None) -> str:
     if tracker_file.exists():
         with open(tracker_file) as f:
             predictions = json.load(f)
-        active = [p for p in predictions if p["status"] == "active"]
+        # Controls are baseline samples, not picks — keep them out of the digest
+        active = [p for p in predictions if p["status"] == "active" and not p.get("control")]
         if active:
             # Deduplicate: group by ticker, use first entry date
             ticker_groups = {}

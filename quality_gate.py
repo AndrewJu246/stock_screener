@@ -49,9 +49,17 @@ def apply_quality_gate(stock_result: dict) -> dict:
     }
 
     # 3. Revenue required (no pre-revenue hype)
-    fund_score = signals.get("fundamentals", {}).get("score", 0)
-    fund_detail = signals.get("fundamentals", {}).get("detail", "")
-    has_revenue = fund_score > 0 and "revenue=0" not in fund_detail.lower()
+    fund_sig = signals.get("fundamentals", {})
+    fund_score = fund_sig.get("score", 0)
+    fund_detail = fund_sig.get("detail", "")
+    hrd = fund_sig.get("has_revenue_data", "missing")
+    if hrd == "missing":
+        # Legacy scoring path without the explicit flag
+        has_revenue = fund_score > 0 and "revenue=0" not in fund_detail.lower()
+    else:
+        # False = confirmed pre-revenue → reject; None = unknown → allow
+        # (other gates still apply)
+        has_revenue = hrd is not False
     checks["has_revenue"] = {
         "passed": has_revenue,
         "detail": fund_detail,
@@ -99,10 +107,12 @@ def apply_quality_gate(stock_result: dict) -> dict:
         checks["volatility"] = {"passed": True, "detail": "No volatility data"}
 
     # 7. Signal agreement (min 2 families must score ≥50)
+    # no_data signals sit at neutral 50 — they must not count as "agreeing"
     min_agree = QUALITY_GATE["min_signal_agreement"]
     high_signals = sum(
         1 for sig_name, sig_data in signals.items()
-        if isinstance(sig_data, dict) and sig_data.get("score", 0) >= 50
+        if isinstance(sig_data, dict) and not sig_data.get("no_data")
+        and sig_data.get("score", 0) >= 50
     )
     agree_passed = high_signals >= min_agree
     checks["signal_agreement"] = {
@@ -128,30 +138,30 @@ def apply_confidence_ladder(stock_result: dict, signal_history: Optional[dict] =
     """
     Apply the confidence ladder to determine signal reliability.
 
+    high   = signal persisted min_days AND 3+ signal families ≥60
+    medium = one of the two
+    low    = neither
+
     Returns confidence_level: "high", "medium", "low"
     and the checks that were applied.
     """
     checks = {}
-    confidence = "high"
 
     # Time confirmation: signal must persist for N days
-    # (This requires historical signal data — skip if not available yet)
     min_days = CONFIDENCE_LADDER["min_days_signal_persists"]
     if signal_history:
-        # Check if signal scores have been consistently above threshold
         days_active = signal_history.get("days_above_threshold", 0)
+        time_ok = days_active >= min_days
         checks["time_confirmation"] = {
-            "passed": days_active >= min_days,
-            "detail": f"Signal active for {days_active} days (need {min_days})",
+            "passed": time_ok,
+            "detail": f"Flagged {days_active} of last 7 days (need {min_days})",
         }
-        if days_active < min_days:
-            confidence = "medium"
     else:
+        time_ok = False
         checks["time_confirmation"] = {
             "passed": False,
             "detail": "First scan — no history yet. Will confirm over coming days.",
         }
-        confidence = "medium"
 
     # Multi-signal agreement (already checked in quality gate, but higher bar here)
     signals = stock_result.get("signals", {})
@@ -164,8 +174,15 @@ def apply_confidence_ladder(stock_result: dict, signal_history: Optional[dict] =
         "passed": strong_agree,
         "detail": f"{high_signals} signals ≥60",
     }
-    if not strong_agree:
-        confidence = min(confidence, "medium")
+
+    # NOTE: never compare confidence strings with min()/max() — that's
+    # alphabetical ("high" < "low" < "medium") and was silently wrong before
+    if time_ok and strong_agree:
+        confidence = "high"
+    elif time_ok or strong_agree:
+        confidence = "medium"
+    else:
+        confidence = "low"
 
     # Backtest check (placeholder — built in Phase 3)
     checks["backtest"] = {

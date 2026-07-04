@@ -40,7 +40,7 @@ def discovery_potential_score(
     Lower = already crowded, limited upside.
     """
     if not financials:
-        return {"score": 50, "detail": "No data — neutral discovery score"}
+        return {"score": 50, "no_data": True, "detail": "No data — neutral discovery score"}
 
     scores = {}
     details = []

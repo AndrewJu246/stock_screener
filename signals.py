@@ -40,7 +40,9 @@ def volume_anomaly_score(hist: pd.DataFrame) -> dict:
     lookback = params["lookback_days"]
 
     if hist is None or len(hist) < lookback + 5:
-        return {"score": 0, "detail": "Insufficient data"}
+        # no_data: neutral 50 + excluded from composite (weights renormalize).
+        # A 0 here read as "maximally bearish" and buried young listings.
+        return {"score": 50, "no_data": True, "detail": "Insufficient data"}
 
     vol = hist["Volume"].values.astype(float)
     close = hist["Close"].values.astype(float)
@@ -48,7 +50,7 @@ def volume_anomaly_score(hist: pd.DataFrame) -> dict:
     # Average volume over lookback (excluding last 5 days)
     avg_vol = np.mean(vol[-lookback:-5])
     if avg_vol <= 0:
-        return {"score": 0, "detail": "No volume history"}
+        return {"score": 50, "no_data": True, "detail": "No volume history"}
 
     # Recent 5-day average volume
     recent_vol = np.mean(vol[-5:])
@@ -93,7 +95,7 @@ def momentum_score(hist: pd.DataFrame) -> dict:
     windows = params["windows"]
 
     if hist is None or len(hist) < max(windows) + 5:
-        return {"score": 0, "detail": "Insufficient data"}
+        return {"score": 50, "no_data": True, "detail": "Insufficient history (young listing)"}
 
     close = hist["Close"].values.astype(float)
     current = close[-1]
@@ -169,13 +171,22 @@ def fundamentals_score(financials: dict) -> dict:
     and earnings growth.
     """
     if not financials:
-        return {"score": 0, "detail": "No financial data"}
+        return {"score": 50, "no_data": True, "has_revenue_data": None,
+                "detail": "No financial data"}
 
     params = SIGNAL_PARAMS["fundamentals"]
-    scores = {}
+    # None = component not computable (missing data) — its weight gets
+    # renormalized away instead of scoring 0 and dragging the composite
+    scores = {"revenue": None, "margin": None, "earnings": None}
+
+    # Whether the company has revenue at all (for the pre-revenue gate):
+    # True/False when data exists, None when unknown
+    has_revenue_data = None
 
     # Revenue growth acceleration
     rev = financials.get("revenue_quarterly")
+    if rev:
+        has_revenue_data = any(r.get("value", 0) > 0 for r in rev)
     if rev and len(rev) >= 4:
         values = [r["value"] for r in sorted(rev, key=lambda x: x["date"])]
         if len(values) >= 4 and values[-4] != 0 and values[-2] != 0:
@@ -191,8 +202,6 @@ def fundamentals_score(financials: dict) -> dict:
                 scores["revenue"] = max(0, 30 + growth_recent * 100)
         else:
             scores["revenue"] = 30  # Neutral
-    else:
-        scores["revenue"] = 0
 
     # Margin expansion (gross profit / revenue trending up)
     gp = financials.get("gross_profit_quarterly")
@@ -206,8 +215,6 @@ def fundamentals_score(financials: dict) -> dict:
             scores["margin"] = np.clip(50 + margin_chg * 500, 0, 100)
         else:
             scores["margin"] = 30
-    else:
-        scores["margin"] = 0
 
     # Earnings growth
     ni = financials.get("net_income_quarterly")
@@ -218,19 +225,27 @@ def fundamentals_score(financials: dict) -> dict:
             scores["earnings"] = np.clip(50 + earnings_growth * 100, 0, 100)
         else:
             scores["earnings"] = 30
-    else:
-        scores["earnings"] = 0
 
-    # Weighted composite
-    w = params
-    total = (
-        scores.get("revenue", 0) * w["revenue_growth_weight"]
-        + scores.get("margin", 0) * w["margin_expansion_weight"]
-        + scores.get("earnings", 0) * w["earnings_growth_weight"]
-    )
+    # Weighted composite over the components we could actually compute
+    comp_weights = {
+        "revenue": params["revenue_growth_weight"],
+        "margin": params["margin_expansion_weight"],
+        "earnings": params["earnings_growth_weight"],
+    }
+    available = {k: v for k, v in scores.items() if v is not None}
+    if not available:
+        return {"score": 50, "no_data": True, "has_revenue_data": has_revenue_data,
+                "detail": "No usable fundamental data"}
 
-    parts = ", ".join(f"{k}={v:.0f}" for k, v in scores.items() if v > 0)
-    return {"score": round(total, 1), "detail": f"Fundamentals: {parts}"}
+    total_w = sum(comp_weights[k] for k in available)
+    total = sum(v * comp_weights[k] for k, v in available.items()) / total_w
+
+    parts = ", ".join(f"{k}={v:.0f}" for k, v in available.items())
+    missing = [k for k, v in scores.items() if v is None]
+    if missing:
+        parts += f" (no {'/'.join(missing)} data)"
+    return {"score": round(total, 1), "has_revenue_data": has_revenue_data,
+            "detail": f"Fundamentals: {parts}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -244,8 +259,11 @@ def smart_money_score(
     """
     Score insider buying clusters and institutional accumulation.
     """
+    if not insider_txns and not institutional:
+        return {"score": 50, "no_data": True, "detail": "No insider or institutional data"}
+
     params = SIGNAL_PARAMS["smart_money"]
-    insider_score = 0
+    insider_score = 30  # Neutral default — absence of insider data isn't bearish
     inst_score = 0
 
     # Insider buying
@@ -264,7 +282,11 @@ def smart_money_score(
             except Exception:
                 continue
 
-            if txn_date.tz_localize(None) if txn_date.tzinfo else txn_date < lookback:
+            # Normalize to tz-naive BEFORE comparing — the old one-line
+            # ternary bound as `(localized) if tzinfo else (date < lookback)`,
+            # which silently skipped every tz-aware transaction
+            naive_date = txn_date.tz_localize(None) if txn_date.tzinfo else txn_date
+            if naive_date < lookback:
                 continue
 
             if "purchase" in txn_type or "buy" in txn_type:
@@ -283,11 +305,28 @@ def smart_money_score(
         else:
             insider_score = 30  # Neutral
 
-    # Institutional (simple: more holders + high value = positive)
+    # Institutional: base = breadth + size; then an accumulation boost /
+    # distribution penalty from how top holders CHANGED their positions
+    # since the prior 13F (the trend says more than the level)
     if institutional:
         num_inst = len(institutional)
         total_value = sum(h.get("value", 0) for h in institutional)
-        inst_score = min(30 + num_inst * 2 + total_value / 1e9 * 10, 100)
+        # Base capped at 85 — the last ±15 points are earned by whether
+        # holders are actually adding or trimming
+        inst_score = min(30 + num_inst * 2 + total_value / 1e9 * 10, 85)
+
+        changes = [
+            h["pct_change"] for h in institutional
+            if h.get("pct_change") is not None
+        ]
+        if changes:
+            # Clip each holder to ±50% so one new mega-position can't
+            # dominate, then average: +10% avg accumulation → +10 pts on
+            # the institutional component (cap ±15)
+            clipped = [max(-0.5, min(0.5, c)) for c in changes]
+            avg_chg = sum(clipped) / len(clipped)
+            accum_bonus = max(-15.0, min(15.0, avg_chg * 100))
+            inst_score = float(np.clip(inst_score + accum_bonus, 0, 100))
     else:
         inst_score = 20  # Neutral — absence of data isn't bearish
 
@@ -305,30 +344,24 @@ def smart_money_score(
 
 def sector_rotation_score(
     stock_sector: str,
-    sector_etf_momentum: dict[str, float],
+    sector_spdr_momentum: dict[str, float],
 ) -> dict:
     """
-    Is money flowing into this stock's sector/megatrend?
-    Higher sector momentum = higher score.
+    Is money rotating into this stock's sector?
+
+    Scored from the sector's SPDR ETF momentum RELATIVE to SPY (1m/3m
+    blend, beta-neutral), covering all 11 GICS sectors. The old version
+    reused megatrend-ETF momentum and only mapped tech-adjacent sectors —
+    everything else got a flat 40.
     """
-    # Find which megatrends this sector maps to
-    relevant_trends = []
-    for trend_key, trend_info in MEGATRENDS.items():
-        if stock_sector in trend_info.get("sectors", []):
-            mom = sector_etf_momentum.get(trend_key, 0)
-            relevant_trends.append((trend_info["name"], mom))
+    rel = sector_spdr_momentum.get(stock_sector)
+    if rel is None:
+        return {"score": 50, "no_data": True,
+                "detail": f"No sector ETF mapping for '{stock_sector}'"}
 
-    if not relevant_trends:
-        return {"score": 40, "detail": f"Sector '{stock_sector}' not mapped to megatrends"}
-
-    # Average momentum across relevant megatrends
-    avg_mom = np.mean([m for _, m in relevant_trends])
-
-    # Map momentum to score: -10% → 10, 0% → 50, +20% → 90
-    score = np.clip(50 + avg_mom * 2, 0, 100)
-
-    best = max(relevant_trends, key=lambda x: x[1])
-    detail = f"Sector momentum: {best[0]} {best[1]:+.1f}%"
+    # Map relative momentum to score: -5% → 25, 0% → 50, +5% → 75
+    score = float(np.clip(50 + rel * 5, 0, 100))
+    detail = f"{stock_sector} vs SPY: {rel:+.1f}% (1m/3m blend)"
 
     return {"score": round(score, 1), "detail": detail}
 
@@ -344,7 +377,7 @@ def earnings_quality_score(financials: dict) -> dict:
     Lottery stocks often have earnings without cash.
     """
     if not financials:
-        return {"score": 0, "detail": "No financial data"}
+        return {"score": 50, "no_data": True, "detail": "No financial data"}
 
     params = SIGNAL_PARAMS["earnings_quality"]
 
@@ -352,7 +385,7 @@ def earnings_quality_score(financials: dict) -> dict:
     ni = financials.get("net_income_quarterly")
 
     if not cffo or not ni or len(cffo) < 2 or len(ni) < 2:
-        return {"score": 30, "detail": "Insufficient cash flow data"}
+        return {"score": 50, "no_data": True, "detail": "Insufficient cash flow data"}
 
     cffo_vals = [r["value"] for r in sorted(cffo, key=lambda x: x["date"])]
     ni_vals = [r["value"] for r in sorted(ni, key=lambda x: x["date"])]
@@ -405,14 +438,16 @@ def analyst_revisions_score(financials: dict) -> dict:
     Also detects when price has overshot analyst targets (overextension risk).
     """
     if not financials:
-        return {"score": 0, "detail": "No analyst data"}
+        return {"score": 50, "no_data": True, "detail": "No analyst data"}
 
     target = financials.get("analyst_target_mean")
     current = financials.get("current_price")
     recommendation = financials.get("analyst_recommendation", "")
 
     if not target or not current or current <= 0:
-        return {"score": 30, "detail": "No analyst target available"}
+        # No coverage is a discovery_potential positive, but for THIS
+        # signal it's simply no data — stay neutral and renormalize
+        return {"score": 50, "no_data": True, "detail": "No analyst target available"}
 
     # Upside to analyst target
     upside = (target - current) / current
@@ -459,7 +494,7 @@ def tech_megatrend_score(
     and (c) R&D investment level.
     """
     if not financials:
-        return {"score": 0, "detail": "No data"}
+        return {"score": 50, "no_data": True, "detail": "No data"}
 
     sector = financials.get("sector", "")
     industry = financials.get("industry", "")
@@ -528,7 +563,7 @@ def relative_strength_score(
     Is this stock outperforming its sector peers?
     """
     if sector_median_return_3m is None:
-        return {"score": 50, "detail": "No peer comparison data"}
+        return {"score": 50, "no_data": True, "detail": "No peer comparison data"}
 
     # Relative performance
     relative = stock_return_3m - sector_median_return_3m
@@ -579,6 +614,7 @@ def compute_all_signals(
     institutional: list[dict],
     sector_etf_momentum: dict[str, float],
     sector_median_return: float,
+    sector_spdr_momentum: Optional[dict] = None,
 ) -> dict:
     """
     Run all 9 signal calculators and return a unified result dict.
@@ -594,7 +630,7 @@ def compute_all_signals(
         "momentum": momentum_score(hist),
         "fundamentals": fundamentals_score(financials),
         "smart_money": smart_money_score(insider_txns, institutional),
-        "sector_rotation": sector_rotation_score(sector, sector_etf_momentum),
+        "sector_rotation": sector_rotation_score(sector, sector_spdr_momentum or {}),
         "earnings_quality": earnings_quality_score(financials),
         "analyst_revisions": analyst_revisions_score(financials),
         "tech_megatrend": tech_megatrend_score(financials, sector_etf_momentum),

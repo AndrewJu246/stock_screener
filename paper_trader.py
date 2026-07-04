@@ -221,13 +221,46 @@ def check_exits(portfolio: dict) -> dict:
             if hist is None or hist.empty:
                 continue
 
-            current_price = float(hist["Close"].iloc[-1])
+            # dropna: yfinance returns NaN rows for holidays/unsettled days
+            close = hist["Close"].dropna()
+            if close.empty:
+                continue
+            current_price = float(close.iloc[-1])
             entry_price = pos["entry_price"]
             shares_remaining = pos["shares"]
 
             if shares_remaining <= 0:
                 positions_to_remove.append(ticker)
                 continue
+
+            # Split guard: prices are split-adjusted but the entry was
+            # recorded at buy time — without this, a split in a held
+            # position reads as a huge "loss" and cascades through every
+            # stop-loss tier as fake realized losses.
+            prev_price = pos.get("current_price") or 0
+            suspicious = (
+                (entry_price > 0 and current_price / entry_price - 1 < -0.45)
+                or (prev_price > 0 and current_price < 0.6 * prev_price)
+                or (prev_price > 0 and current_price > 1.8 * prev_price)
+            )
+            if suspicious:
+                from tracker import _split_ratio_since
+                entry_d = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+                ratio = _split_ratio_since(ticker, entry_d)
+                if ratio != 1.0:
+                    # Adjust holdings the way a broker would: more shares,
+                    # lower basis, same position value
+                    pos["entry_price"] = round(entry_price / ratio, 4)
+                    pos["shares"] = int(round(pos["shares"] * ratio))
+                    pos["original_shares"] = int(round(pos["original_shares"] * ratio))
+                    pos["shares_sold"] = int(round(pos.get("shares_sold", 0) * ratio))
+                    pos["peak_price"] = round(pos.get("peak_price", entry_price) / ratio, 4)
+                    entry_price = pos["entry_price"]
+                    shares_remaining = pos["shares"]
+                    logger.info(
+                        f"Paper trader: {ticker} split {ratio:g}x since entry — "
+                        f"position adjusted ({pos['shares']} sh @ ${entry_price:.2f})"
+                    )
 
             # Update position
             pos["current_price"] = current_price

@@ -419,10 +419,16 @@ def get_insider_transactions(ticker: str) -> Optional[list[dict]]:
 
         transactions = []
         for _, row in insider_df.iterrows():
+            # yfinance's "Transaction" column exists but comes back empty —
+            # the buy/sell wording lives in "Text" ("Purchase at price ...").
+            # .get() only falls back on a MISSING column, not an empty one.
+            txn_type = row.get("Transaction")
+            if pd.isna(txn_type) or not str(txn_type).strip():
+                txn_type = row.get("Text", "")
             txn = {
                 "date": str(row.get("Start Date", "")),
                 "insider": str(row.get("Insider Trading", row.get("Insider", ""))),
-                "type": str(row.get("Transaction", row.get("Text", ""))),
+                "type": str(txn_type) if pd.notna(txn_type) else "",
                 "shares": int(row.get("Shares", 0)) if pd.notna(row.get("Shares")) else 0,
                 "value": float(row.get("Value", 0)) if pd.notna(row.get("Value")) else 0,
             }
@@ -463,11 +469,17 @@ def get_institutional_holders(ticker: str) -> Optional[list[dict]]:
 
         result = []
         for _, row in holders.iterrows():
+            # yfinance renamed "% Out" → "pctHeld" (fraction, e.g. 0.078)
+            pct = row.get("pctHeld", row.get("% Out", 0))
+            # pctChange = holder's position change since prior filing
+            # (fraction; +1.0 = doubled). Feeds accumulation detection.
+            chg = row.get("pctChange")
             result.append({
                 "holder": str(row.get("Holder", "")),
                 "shares": int(row.get("Shares", 0)) if pd.notna(row.get("Shares")) else 0,
                 "date_reported": str(row.get("Date Reported", "")),
-                "pct_held": float(row.get("% Out", 0)) if pd.notna(row.get("% Out")) else 0,
+                "pct_held": float(pct) if pd.notna(pct) else 0,
+                "pct_change": float(chg) if chg is not None and pd.notna(chg) else None,
                 "value": float(row.get("Value", 0)) if pd.notna(row.get("Value")) else 0,
             })
 
@@ -497,15 +509,16 @@ def get_market_regime_data() -> dict:
         if hist.empty:
             return {"regime": "balanced", "reason": "No market data available"}
 
-        close = hist["Close"]
+        close = hist["Close"].dropna()
         current = close.iloc[-1]
-        ma50 = close.rolling(50).mean().iloc[-1]
-        ma200 = close.rolling(200).mean().iloc[-1]
+        ma50 = close.rolling(50).mean().dropna().iloc[-1]
+        ma200 = close.rolling(200).mean().dropna().iloc[-1]
 
         # VIX
         vix = yf.Ticker("^VIX")
         vix_hist = vix.history(period="5d")
-        vix_level = vix_hist["Close"].iloc[-1] if not vix_hist.empty else 20
+        vix_close = vix_hist["Close"].dropna() if not vix_hist.empty else None
+        vix_level = vix_close.iloc[-1] if vix_close is not None and len(vix_close) > 0 else 20
 
         return {
             "sp500_price": float(current),
@@ -526,6 +539,59 @@ def get_market_regime_data() -> dict:
 # Sector ETF data (for megatrend tracking)
 # ═══════════════════════════════════════════════════════════════════════
 
+# GICS sector → SPDR sector ETF (yfinance sector naming)
+SECTOR_ETFS = {
+    "Technology": "XLK",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Utilities": "XLU",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+
+
+def get_sector_spdr_momentum() -> dict[str, float]:
+    """
+    Relative momentum per GICS sector: SPDR sector ETF return minus SPY
+    return, blended 1-month (60%) + 3-month (40%). Positive = money
+    rotating INTO the sector; measuring vs SPY keeps it beta-neutral.
+    Returns {sector_name: relative_momentum_pct}.
+    """
+    def _returns(tkr: str):
+        hist = get_price_history(tkr, period="6mo")
+        if hist is None:
+            return None
+        close = hist["Close"].dropna()
+        if len(close) < 63:
+            return None
+        r1m = (close.iloc[-1] / close.iloc[-21] - 1) * 100
+        r3m = (close.iloc[-1] / close.iloc[-63] - 1) * 100
+        return float(r1m), float(r3m)
+
+    spy = _returns("SPY")
+    results = {}
+    if spy is None:
+        return results
+
+    for sector, etf in SECTOR_ETFS.items():
+        try:
+            r = _returns(etf)
+            if r is None:
+                continue
+            rel_1m = r[0] - spy[0]
+            rel_3m = r[1] - spy[1]
+            results[sector] = round(0.6 * rel_1m + 0.4 * rel_3m, 2)
+        except Exception:
+            continue
+
+    return results
+
+
 def get_sector_etf_momentum() -> dict[str, float]:
     """
     Get 3-month momentum for megatrend ETF proxies.
@@ -539,8 +605,9 @@ def get_sector_etf_momentum() -> dict[str, float]:
             try:
                 hist = get_price_history(etf, period="6mo")
                 if hist is not None and len(hist) >= 63:
-                    close = hist["Close"]
-                    mom_3m = (close.iloc[-1] / close.iloc[-63] - 1) * 100
+                    close = hist["Close"].dropna()
+                    if len(close) >= 63:
+                        mom_3m = (close.iloc[-1] / close.iloc[-63] - 1) * 100
                     momentums.append(float(mom_3m))
             except Exception:
                 continue

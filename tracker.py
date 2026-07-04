@@ -36,6 +36,13 @@ SIGNAL_STATS_FILE = TRACKER_DIR / "signal_performance.json"
 # Checkpoints: we evaluate performance at these intervals
 EVAL_DAYS = [7, 14, 30, 60, 90]
 
+# Signal-semantics version stamped on every new prediction. Rows without
+# the field are v1 (pre Jul 3, 2026): sector_rotation was megatrend-based,
+# smart_money's insider component was inert, discovery_potential's
+# institutional component was constant. Bump this when signal definitions
+# change so edge/ML analysis can avoid mixing incompatible score meanings.
+SIGNAL_VERSION = 2
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Data persistence
@@ -69,14 +76,61 @@ def _save_signal_stats(stats: dict):
 # Logging predictions
 # ═══════════════════════════════════════════════════════════════════════
 
+def _build_prediction(c: dict, date_str: str, control: bool = False) -> dict:
+    """Build a tracked prediction row from a scored screener result."""
+    prediction = {
+        "id": f"{c['ticker']}_{date_str}",
+        "ticker": c["ticker"],
+        "entry_date": date_str,
+        "entry_price": c.get("current_price", 0),
+        "composite_score": c.get("composite_score", 0),
+        "rank": c.get("rank", 0),
+        "regime": c.get("regime", "unknown"),
+        "sector": c.get("sector", "Unknown"),
+        "industry": c.get("industry", "Unknown"),
+
+        # Full signal snapshot
+        "signals": {
+            name: sig.get("score", 0)
+            for name, sig in c.get("signals", {}).items()
+        },
+        # Which signals were "high" (≥60)
+        "high_signals": [
+            name for name, sig in c.get("signals", {}).items()
+            if isinstance(sig, dict) and sig.get("score", 0) >= 60
+        ],
+
+        "strategy": c.get("strategy", {}).get("strategy", "unknown"),
+        "confidence": c.get("confidence", {}).get("confidence", "unknown"),
+        "signal_version": SIGNAL_VERSION,
+
+        # Performance tracking (filled in by update_predictions)
+        "status": "active",
+        "performance": {str(d): None for d in EVAL_DAYS},
+        "peak_return": 0,
+        "trough_return": 0,
+        "current_price": c.get("current_price", 0),
+        "current_return": 0,
+        "last_updated": date_str,
+        "days_tracked": 0,
+    }
+    if control:
+        # Random unflagged gate-passer — the baseline picks must beat.
+        # Excluded from picks displays and confidence counting, but
+        # included in edge/IC/ML analysis (widens the score distribution).
+        prediction["control"] = True
+    return prediction
+
+
 def log_predictions(scan_results: dict) -> int:
     """
-    Log the top candidates from a scan as predictions to track.
+    Log the top candidates from a scan as predictions to track,
+    plus the scan's control group (random unflagged gate-passers).
 
     Called automatically after each scan. Only logs NEW predictions
     (won't duplicate if you run the scan twice on the same day).
 
-    Returns: number of new predictions logged.
+    Returns: number of new pick predictions logged.
     """
     existing = _load_predictions()
     existing_keys = {
@@ -93,49 +147,24 @@ def log_predictions(scan_results: dict) -> int:
         key = (c["ticker"], date_str)
         if key in existing_keys:
             continue
-
-        prediction = {
-            "id": f"{c['ticker']}_{date_str}",
-            "ticker": c["ticker"],
-            "entry_date": date_str,
-            "entry_price": c.get("current_price", 0),
-            "composite_score": c.get("composite_score", 0),
-            "rank": c.get("rank", 0),
-            "regime": c.get("regime", "unknown"),
-            "sector": c.get("sector", "Unknown"),
-            "industry": c.get("industry", "Unknown"),
-
-            # Full signal snapshot
-            "signals": {
-                name: sig.get("score", 0)
-                for name, sig in c.get("signals", {}).items()
-            },
-            # Which signals were "high" (≥60)
-            "high_signals": [
-                name for name, sig in c.get("signals", {}).items()
-                if isinstance(sig, dict) and sig.get("score", 0) >= 60
-            ],
-
-            "strategy": c.get("strategy", {}).get("strategy", "unknown"),
-            "confidence": c.get("confidence", {}).get("confidence", "unknown"),
-
-            # Performance tracking (filled in by update_predictions)
-            "status": "active",
-            "performance": {str(d): None for d in EVAL_DAYS},
-            "peak_return": 0,
-            "trough_return": 0,
-            "current_price": c.get("current_price", 0),
-            "current_return": 0,
-            "last_updated": date_str,
-            "days_tracked": 0,
-        }
-
-        existing.append(prediction)
+        existing.append(_build_prediction(c, date_str))
         existing_keys.add(key)
         new_count += 1
 
+    control_count = 0
+    for c in scan_results.get("controls", []):
+        key = (c["ticker"], date_str)
+        if key in existing_keys:
+            continue
+        existing.append(_build_prediction(c, date_str, control=True))
+        existing_keys.add(key)
+        control_count += 1
+
     _save_predictions(existing)
-    logger.info(f"Tracker: logged {new_count} new predictions (total: {len(existing)})")
+    logger.info(
+        f"Tracker: logged {new_count} new predictions + {control_count} controls "
+        f"(total: {len(existing)})"
+    )
     return new_count
 
 
@@ -143,10 +172,64 @@ def log_predictions(scan_results: dict) -> int:
 # Updating predictions with current prices
 # ═══════════════════════════════════════════════════════════════════════
 
+def _split_ratio_since(ticker: str, entry_date) -> float:
+    """Cumulative split ratio since entry_date (1.0 = no split). Extra API
+    call, so only invoked when a return looks like a split artifact."""
+    try:
+        import yfinance as yf
+        splits = yf.Ticker(ticker).splits
+        if splits is None or splits.empty:
+            return 1.0
+        since = splits[splits.index >= entry_date.isoformat()]
+        ratio = 1.0
+        for r in since:
+            if r and r > 0:
+                ratio *= float(r)
+        return ratio
+    except Exception:
+        return 1.0
+
+
+def _benchmark_return(spy_close, start_date, end_date) -> Optional[float]:
+    """SPY return between the nearest trading days to two dates."""
+    try:
+        s = spy_close.index.asof(str(start_date))
+        e = spy_close.index.asof(str(end_date))
+        if str(s) == "NaT" or str(e) == "NaT":
+            return None
+        start_p = float(spy_close.loc[s])
+        end_p = float(spy_close.loc[e])
+        return round((end_p - start_p) / start_p, 4)
+    except Exception:
+        return None
+
+
+def _backfill_benchmark_returns(predictions: list[dict], spy_close) -> int:
+    """Add spy_return/excess_return to checkpoints filled before the
+    benchmark upgrade (Jul 2026). Idempotent — skips rows that have it."""
+    filled = 0
+    for pred in predictions:
+        try:
+            entry_date = datetime.strptime(pred["entry_date"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            continue
+        for key, cp in (pred.get("performance") or {}).items():
+            if not isinstance(cp, dict) or "spy_return" in cp:
+                continue
+            target = cp.get("date") or str(entry_date + timedelta(days=int(key)))
+            spy_ret = _benchmark_return(spy_close, entry_date, target)
+            if spy_ret is not None:
+                cp["spy_return"] = spy_ret
+                cp["excess_return"] = round(cp["return"] - spy_ret, 4)
+                filled += 1
+    return filled
+
+
 def update_predictions() -> dict:
     """
     Update all active predictions with current prices.
-    Fills in performance checkpoints (7d, 14d, 30d, 60d, 90d).
+    Fills in performance checkpoints (7d, 14d, 30d, 60d, 90d),
+    each with raw return plus SPY benchmark / excess return.
 
     Call this daily (or whenever you run the screener).
 
@@ -159,6 +242,16 @@ def update_predictions() -> dict:
 
     # Import here to avoid circular dependency
     from data_pipeline import get_price_history
+
+    spy_hist = get_price_history("SPY", period="1y")
+    # dropna: holiday/unsettled rows come back as NaN (e.g. Juneteenth 2026)
+    spy_close = spy_hist["Close"].dropna() if spy_hist is not None and not spy_hist.empty else None
+    if spy_close is None:
+        logger.warning("Tracker: SPY history unavailable — benchmark returns skipped this run")
+    else:
+        backfilled = _backfill_benchmark_returns(predictions, spy_close)
+        if backfilled:
+            logger.info(f"Tracker: backfilled benchmark returns on {backfilled} checkpoints")
 
     active = [p for p in predictions if p["status"] == "active"]
     today = datetime.now().date()
@@ -183,7 +276,12 @@ def update_predictions() -> dict:
             if hist is None or hist.empty:
                 continue
 
-            close = hist["Close"]
+            # dropna: yfinance returns NaN rows for holidays/unsettled days —
+            # without this, checkpoints landing on one store NaN returns
+            close = hist["Close"].dropna()
+            if close.empty:
+                continue
+            prev_price = pred.get("current_price") or 0
             current_price = float(close.iloc[-1])
             pred["current_price"] = current_price
             pred["current_return"] = round(
@@ -191,10 +289,35 @@ def update_predictions() -> dict:
             )
             pred["last_updated"] = str(today)
 
+            # Split guard: history is split-adjusted but entry_price was
+            # recorded at scan time, so a split shows up as a fake collapse
+            # (or spike, for reverse splits). The day-over-day price
+            # discontinuity vs the last stored price catches splits the
+            # cumulative-return check would miss (e.g. 2:1 on a big winner).
+            suspicious = (
+                pred["current_return"] < -0.45
+                or pred["current_return"] > 1.5
+                or (prev_price > 0 and current_price < 0.6 * prev_price)
+                or (prev_price > 0 and current_price > 1.8 * prev_price)
+            )
+            if suspicious:
+                ratio = _split_ratio_since(ticker, entry_date)
+                if ratio != 1.0:
+                    entry_price = round(entry_price / ratio, 4)
+                    pred["entry_price"] = entry_price
+                    pred["current_return"] = round(
+                        (current_price - entry_price) / entry_price, 4
+                    )
+                    pred["performance"] = {str(d): None for d in EVAL_DAYS}
+                    logger.info(
+                        f"Tracker: {ticker} split {ratio:g}x since entry — "
+                        f"entry price adjusted, checkpoints refilled"
+                    )
+
             # Track peak and trough
             # Look at all prices since entry
             entry_ts = entry_date.isoformat()
-            mask = hist.index >= entry_ts
+            mask = close.index >= entry_ts
             if mask.any():
                 prices_since = close[mask]
                 peak_price = float(prices_since.max())
@@ -216,17 +339,25 @@ def update_predictions() -> dict:
                     # Find the price on the checkpoint date
                     target_date = entry_date + timedelta(days=eval_d)
                     # Find nearest trading day
-                    nearest = hist.index.asof(str(target_date))
+                    nearest = close.index.asof(str(target_date))
                     if nearest is not None and str(nearest) != "NaT":
                         checkpoint_price = float(close.loc[nearest])
                         checkpoint_return = round(
                             (checkpoint_price - entry_price) / entry_price, 4
                         )
-                        pred["performance"][checkpoint_key] = {
+                        checkpoint = {
                             "price": checkpoint_price,
                             "return": checkpoint_return,
                             "date": str(target_date),
                         }
+                        if spy_close is not None:
+                            spy_ret = _benchmark_return(spy_close, entry_date, target_date)
+                            if spy_ret is not None:
+                                checkpoint["spy_return"] = spy_ret
+                                checkpoint["excess_return"] = round(
+                                    checkpoint_return - spy_ret, 4
+                                )
+                        pred["performance"][checkpoint_key] = checkpoint
 
             updated += 1
 
@@ -262,16 +393,63 @@ def update_predictions() -> dict:
 # Signal performance analysis
 # ═══════════════════════════════════════════════════════════════════════
 
+def _checkpoint_excess(p: dict, eval_key: str = "30"):
+    """Excess return vs SPY at a checkpoint, falling back to raw return."""
+    cp = p.get("performance", {}).get(eval_key)
+    if not isinstance(cp, dict):
+        return None
+    if cp.get("excess_return") is not None:
+        return cp["excess_return"]
+    return cp.get("return")
+
+
+def _picks_vs_controls_stats(evaluable: list[dict], eval_key: str = "30") -> Optional[dict]:
+    """
+    The headline accuracy metric: median 30d excess return of picks vs
+    the random control group, ticker-clustered (one obs per ticker).
+    A model with real edge shows picks_median > controls_median.
+    """
+    def clustered(preds):
+        by_ticker = defaultdict(list)
+        for p in preds:
+            r = _checkpoint_excess(p, eval_key)
+            if r is not None:
+                by_ticker[p["ticker"]].append(r)
+        return [float(np.mean(rs)) for rs in by_ticker.values()]
+
+    picks = clustered([p for p in evaluable if not p.get("control")])
+    controls = clustered([p for p in evaluable if p.get("control")])
+
+    if len(picks) < 5 or len(controls) < 5:
+        return None
+
+    return {
+        "picks_n_tickers": len(picks),
+        "controls_n_tickers": len(controls),
+        "picks_median_excess_30d": round(float(np.median(picks)), 4),
+        "controls_median_excess_30d": round(float(np.median(controls)), 4),
+        "picks_win_rate": round(sum(1 for r in picks if r > 0) / len(picks), 3),
+        "controls_win_rate": round(sum(1 for r in controls if r > 0) / len(controls), 3),
+        "edge_vs_controls": round(
+            float(np.median(picks)) - float(np.median(controls)), 4
+        ),
+    }
+
+
 def _update_signal_stats(predictions: list[dict]):
     """
     Analyze which signals and signal combinations have been predictive.
     This is the core of the self-improvement loop.
     """
-    # Only analyze predictions with at least 30-day data
+    # Only analyze predictions with at least 30-day data.
+    # Controls are included in signal-level analysis (high/low splits and
+    # combos) — they widen the score distribution beyond the top-50 sample.
+    # Pick-performance sections (sector/strategy/regime) exclude them.
     evaluable = [
         p for p in predictions
         if p["performance"].get("30") is not None
     ]
+    evaluable_picks = [p for p in evaluable if not p.get("control")]
 
     if len(evaluable) < 5:
         logger.info("Tracker: need at least 5 predictions with 30-day data for analysis")
@@ -283,21 +461,29 @@ def _update_signal_stats(predictions: list[dict]):
         "sector_performance": {},
         "strategy_performance": {},
         "regime_performance": {},
+        "picks_vs_controls": _picks_vs_controls_stats(evaluable),
         "sample_size": len(evaluable),
+        "control_count": len(evaluable) - len(evaluable_picks),
         "last_updated": str(datetime.now().date()),
     }
 
     SIGNAL_NAMES = [
         "volume_anomaly", "momentum", "fundamentals", "smart_money",
         "sector_rotation", "earnings_quality", "analyst_revisions",
-        "tech_megatrend", "relative_strength",
+        "tech_megatrend", "relative_strength", "discovery_potential",
     ]
+
+    # Signals redefined at signal_version 2 (Jul 3, 2026) — their pre-v2
+    # scores measure a different/broken quantity and must not be mixed in
+    VERSION_SENSITIVE = {"sector_rotation", "smart_money", "discovery_potential"}
+    v2_rows = [p for p in evaluable if p.get("signal_version", 1) >= SIGNAL_VERSION]
 
     # ── Individual signal analysis ────────────────────────────────────
     for sig_name in SIGNAL_NAMES:
+        pool = v2_rows if sig_name in VERSION_SENSITIVE else evaluable
         # Split predictions into "high signal" (≥60) vs "low signal" (<60)
-        high = [p for p in evaluable if p["signals"].get(sig_name, 0) >= 60]
-        low = [p for p in evaluable if p["signals"].get(sig_name, 0) < 60]
+        high = [p for p in pool if p["signals"].get(sig_name, 0) >= 60]
+        low = [p for p in pool if p["signals"].get(sig_name, 0) < 60]
 
         high_returns = [p["performance"]["30"]["return"] for p in high if p["performance"]["30"]]
         low_returns = [p["performance"]["30"]["return"] for p in low if p["performance"]["30"]]
@@ -323,12 +509,17 @@ def _update_signal_stats(predictions: list[dict]):
     for combo_size in [2, 3]:
         for combo in combinations(SIGNAL_NAMES, combo_size):
             combo_key = "+".join(sorted(combo))
+            pool = v2_rows if VERSION_SENSITIVE & set(combo) else evaluable
             matching = [
-                p for p in evaluable
+                p for p in pool
                 if all(s in p.get("high_signals", []) for s in combo)
             ]
 
-            if len(matching) < 3:  # Need minimum sample
+            # Floor is unique tickers, not rows — the same stock flagged on
+            # consecutive scans isn't independent evidence, and with ~175
+            # combos tested a tiny floor guarantees a spurious "winner"
+            unique_tickers = len({p["ticker"] for p in matching})
+            if unique_tickers < 15:
                 continue
 
             returns = [
@@ -340,15 +531,16 @@ def _update_signal_stats(predictions: list[dict]):
             if returns:
                 stats["signal_combos"][combo_key] = {
                     "count": len(matching),
+                    "unique_tickers": unique_tickers,
                     "avg_return_30d": round(np.mean(returns), 4),
                     "win_rate_30d": round(sum(1 for r in returns if r > 0) / len(returns), 3),
                     "best": round(max(returns), 4),
                     "worst": round(min(returns), 4),
                 }
 
-    # ── Sector performance ────────────────────────────────────────────
+    # ── Sector performance (picks only) ───────────────────────────────
     sector_groups = defaultdict(list)
-    for p in evaluable:
+    for p in evaluable_picks:
         r = p["performance"]["30"]["return"] if p["performance"]["30"] else None
         if r is not None:
             sector_groups[p.get("sector", "Unknown")].append(r)
@@ -361,10 +553,10 @@ def _update_signal_stats(predictions: list[dict]):
                 "win_rate_30d": round(sum(1 for r in returns if r > 0) / len(returns), 3),
             }
 
-    # ── Strategy performance ──────────────────────────────────────────
+    # ── Strategy performance (picks only) ─────────────────────────────
     for strategy in ["long_term_hold", "short_term_momentum"]:
         matching = [
-            p for p in evaluable
+            p for p in evaluable_picks
             if p.get("strategy") == strategy and p["performance"]["30"]
         ]
         returns = [p["performance"]["30"]["return"] for p in matching]
@@ -375,10 +567,10 @@ def _update_signal_stats(predictions: list[dict]):
                 "win_rate_30d": round(sum(1 for r in returns if r > 0) / len(returns), 3),
             }
 
-    # ── Regime performance ────────────────────────────────────────────
+    # ── Regime performance (picks only) ───────────────────────────────
     for regime in ["bull", "bear", "early_recovery", "balanced"]:
         matching = [
-            p for p in evaluable
+            p for p in evaluable_picks
             if p.get("regime") == regime and p["performance"]["30"]
         ]
         returns = [p["performance"]["30"]["return"] for p in matching]
@@ -466,15 +658,27 @@ def print_report(detailed: bool = False):
         print("No predictions tracked yet. Run a scan first.")
         return
 
-    active = [p for p in predictions if p["status"] == "active"]
-    completed = [p for p in predictions if p["status"] == "completed"]
-    total = len(predictions)
+    picks = [p for p in predictions if not p.get("control")]
+    controls = [p for p in predictions if p.get("control")]
+    active = [p for p in picks if p["status"] == "active"]
+    completed = [p for p in picks if p["status"] == "completed"]
+    total = len(picks)
 
     print(f"\n{'='*60}")
     print(f"PREDICTION TRACKER REPORT")
     print(f"{'='*60}")
-    print(f"Total predictions: {total}")
+    print(f"Total predictions: {total} (+{len(controls)} controls)")
     print(f"Active: {len(active)} | Completed (90d+): {len(completed)}")
+
+    # Picks vs controls — the honest measure of whether the model picks well
+    pvc = stats.get("picks_vs_controls")
+    if pvc:
+        print(f"\nPICKS vs CONTROLS (30d excess vs SPY, ticker-clustered):")
+        print(f"  Picks:    median {pvc['picks_median_excess_30d']:+.2%} | "
+              f"win {pvc['picks_win_rate']:.0%} | n={pvc['picks_n_tickers']} tickers")
+        print(f"  Controls: median {pvc['controls_median_excess_30d']:+.2%} | "
+              f"win {pvc['controls_win_rate']:.0%} | n={pvc['controls_n_tickers']} tickers")
+        print(f"  Edge vs controls: {pvc['edge_vs_controls']:+.2%}")
 
     # Active predictions summary
     if active:
@@ -499,10 +703,10 @@ def print_report(detailed: bool = False):
             f"{p['trough_return']:>+7.2%} {p['strategy']:<18} {p['confidence']:<8}"
         )
 
-    # Checkpoint performance
+    # Checkpoint performance (picks only — controls tracked separately above)
     for d in EVAL_DAYS:
         has_data = [
-            p for p in predictions
+            p for p in picks
             if p["performance"].get(str(d)) is not None
         ]
         if has_data:

@@ -35,7 +35,9 @@ def load_results() -> dict:
 def load_predictions() -> list:
     if PREDICTIONS_PATH.exists():
         with open(PREDICTIONS_PATH) as f:
-            return json.load(f)
+            preds = json.load(f)
+        # Controls are random baseline samples, not picks — analysis-only
+        return [p for p in preds if not p.get("control")]
     return []
 
 

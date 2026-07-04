@@ -21,7 +21,7 @@ import argparse
 import json
 import logging
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -42,14 +42,23 @@ EVAL_WINDOW = 30          # Predict 30-day forward returns
 SIGNAL_FEATURES = [
     "volume_anomaly", "momentum", "fundamentals", "smart_money",
     "sector_rotation", "earnings_quality", "analyst_revisions",
-    "tech_megatrend", "relative_strength",
+    "tech_megatrend", "relative_strength", "discovery_potential",
 ]
+
+# signal_version is an extra feature: sector_rotation/smart_money/
+# discovery_potential scores mean different things before v2 (Jul 3, 2026),
+# and the tree can learn to condition on the version instead of averaging
+# a live signal with a dead one. At predict time it's always the current
+# version, so v1-conditional branches simply never fire on new picks.
+CURRENT_SIGNAL_VERSION = 2
+FEATURE_NAMES = SIGNAL_FEATURES + ["signal_version"]
 
 # Check if sklearn is available
 _SKLEARN_AVAILABLE = False
 try:
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.model_selection import cross_val_score, train_test_split
+    from sklearn.model_selection import cross_val_score, GroupKFold, GroupShuffleSplit
     from sklearn.metrics import classification_report, accuracy_score
     _SKLEARN_AVAILABLE = True
 except ImportError:
@@ -106,10 +115,14 @@ def check_data_readiness() -> dict:
 
 def prepare_training_data() -> Optional[tuple]:
     """
-    Prepare feature matrix (X) and labels (y) from prediction history.
+    Prepare feature matrix (X), labels (y), groups (tickers), and entry
+    dates from prediction history.
 
-    X = signal scores (9 features)
-    y = 1 if stock went up over EVAL_WINDOW days, 0 if down
+    X = signal scores
+    y = 1 if the stock beat SPY over EVAL_WINDOW days, 0 otherwise
+    groups/dates power leak-free validation: the same ticker flagged on
+    consecutive scans produces near-identical rows, so ticker groups must
+    never straddle a train/test boundary.
     """
     tracker_file = Path("tracker_data/predictions.json")
     if not tracker_file.exists():
@@ -120,6 +133,8 @@ def prepare_training_data() -> Optional[tuple]:
 
     X = []
     y = []
+    groups = []
+    dates = []
 
     eval_key = str(EVAL_WINDOW)
 
@@ -128,21 +143,35 @@ def prepare_training_data() -> Optional[tuple]:
         if perf is None:
             continue
 
-        # Feature vector: signal scores
+        forward_return = perf.get("return", 0) if isinstance(perf, dict) else perf
+
+        # Artifact guard: a real 30d loss beyond -75% doesn't survive the
+        # quality gate — anything there is an unadjusted split or bad price
+        if forward_return is None or forward_return < -0.75:
+            continue
+
+        # Feature vector: signal scores + signal-semantics version
         signals = p.get("signals", {})
         features = [signals.get(s, 0) for s in SIGNAL_FEATURES]
+        features.append(p.get("signal_version", 1))
 
-        # Label: 1 if positive return, 0 if negative
-        forward_return = perf.get("return", 0) if isinstance(perf, dict) else perf
-        label = 1 if forward_return > 0 else 0
+        # Label: 1 if the stock beat SPY over the window — raw direction
+        # mostly measures the market (in a bull tape everything is "up")
+        if isinstance(perf, dict) and perf.get("excess_return") is not None:
+            label_return = perf["excess_return"]
+        else:
+            label_return = forward_return  # legacy rows without benchmark data
+        label = 1 if label_return > 0 else 0
 
         X.append(features)
         y.append(label)
+        groups.append(p.get("ticker", "?"))
+        dates.append(p.get("entry_date", ""))
 
     if len(X) < MIN_PREDICTIONS:
         return None
 
-    return np.array(X), np.array(y)
+    return np.array(X), np.array(y), np.array(groups), np.array(dates)
 
 
 def train_model(force: bool = False) -> Optional[dict]:
@@ -166,7 +195,7 @@ def train_model(force: bool = False) -> Optional[dict]:
         logger.info("ML: insufficient training data")
         return None
 
-    X, y = data
+    X, y, groups, dates = data
     logger.info(f"ML: training on {len(X)} samples ({sum(y)} positive, {len(y) - sum(y)} negative)")
 
     # Check class balance
@@ -174,23 +203,84 @@ def train_model(force: bool = False) -> Optional[dict]:
         logger.warning("ML: class imbalance too extreme, skipping training")
         return None
 
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    # Sort by entry date so the split is temporal: train on earlier scans,
+    # test on later ones (a random split would leak duplicate ticker rows
+    # into both sides and inflate accuracy)
+    order = np.argsort(dates, kind="stable")
+    X, y, groups, dates = X[order], y[order], groups[order], dates[order]
+
+    split_at = int(len(X) * 0.8)
+    # Don't cut a scan day in half
+    while split_at < len(X) and dates[split_at] == dates[split_at - 1]:
+        split_at += 1
+    test_idx = np.arange(split_at, len(X))
+
+    # Embargo: a train row entered <EVAL_WINDOW days before the boundary
+    # has its label measured INSIDE the test period — that overlap leaks
+    # test-period market moves into training. Drop those rows entirely.
+    embargo_days = 0
+    train_idx = np.arange(split_at)
+    if split_at < len(X):
+        try:
+            boundary = datetime.strptime(str(dates[split_at])[:10], "%Y-%m-%d")
+            embargo_cut = (boundary - timedelta(days=EVAL_WINDOW)).strftime("%Y-%m-%d")
+            train_idx = np.array(
+                [i for i in range(split_at) if str(dates[i])[:10] < embargo_cut],
+                dtype=int,
+            )
+            embargo_days = EVAL_WINDOW
+        except ValueError:
+            pass  # unparseable dates — keep un-embargoed temporal split
+
+    # Purge: drop test rows whose ticker already appears in training
+    train_tickers = set(groups[train_idx])
+    purged_test = np.array(
+        [i for i in test_idx if groups[i] not in train_tickers], dtype=int
     )
 
-    # Train gradient boosted classifier
-    model = GradientBoostingClassifier(
+    split_method = "temporal_purged_embargo" if embargo_days else "temporal_purged"
+    if (
+        len(purged_test) >= 20
+        and len(np.unique(y[purged_test])) == 2
+        and len(train_idx) >= 100
+        and len(np.unique(y[train_idx])) == 2
+    ):
+        test_idx = purged_test
+    else:
+        # Purged/embargoed sets too small — fall back to a grouped random
+        # split (leak-free by ticker; time overlap returns, so treat its
+        # accuracy with more suspicion than the temporal split's)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        train_idx, test_idx = next(gss.split(X, y, groups))
+        split_method = "group_shuffle"
+        embargo_days = 0
+
+    X_train, y_train, g_train = X[train_idx], y[train_idx], groups[train_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    logger.info(
+        f"ML: split={split_method}, train={len(X_train)}, test={len(X_test)} "
+        f"({len(set(groups[test_idx]))} unique test tickers)"
+    )
+
+    # Gradient boosted base learner, wrapped in sigmoid calibration so
+    # ml_score reads as a real probability (raw GBM scores cluster near
+    # the extremes and overstate confidence)
+    base_model = GradientBoostingClassifier(
         n_estimators=100,
         max_depth=3,
         learning_rate=0.1,
         min_samples_leaf=10,
         random_state=42,
     )
+    model = CalibratedClassifierCV(base_model, method="sigmoid", cv=3)
 
-    # Cross-validation on training set
-    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring="accuracy")
-    logger.info(f"ML: cross-val accuracy: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
+    # Cross-validation grouped by ticker so folds never share a stock
+    n_folds = min(5, len(set(g_train)))
+    cv_scores = cross_val_score(
+        model, X_train, y_train, cv=GroupKFold(n_splits=n_folds),
+        groups=g_train, scoring="accuracy",
+    )
+    logger.info(f"ML: grouped cross-val accuracy: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
 
     # Train on full training set
     model.fit(X_train, y_train)
@@ -200,8 +290,12 @@ def train_model(force: bool = False) -> Optional[dict]:
     test_accuracy = accuracy_score(y_test, y_pred)
     logger.info(f"ML: test accuracy: {test_accuracy:.3f}")
 
-    # Feature importances
-    importances = dict(zip(SIGNAL_FEATURES, model.feature_importances_))
+    # Feature importances (averaged over the calibration ensemble)
+    imp = np.mean(
+        [cc.estimator.feature_importances_ for cc in model.calibrated_classifiers_],
+        axis=0,
+    )
+    importances = dict(zip(FEATURE_NAMES, imp))
     sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)
     logger.info("ML: feature importances:")
     for feat, imp in sorted_imp:
@@ -223,15 +317,22 @@ def train_model(force: bool = False) -> Optional[dict]:
     with open(MODEL_FILE, "wb") as f:
         pickle.dump(model, f)
 
+    base_rate = max(np.mean(y_test), 1 - np.mean(y_test))
     metadata = {
         "trained_at": datetime.now().isoformat(),
         "samples": len(X),
         "positive_samples": int(sum(y)),
+        "split_method": split_method,
+        "embargo_days": embargo_days,
+        "calibration": "sigmoid_cv3",
+        "train_size": len(X_train),
+        "test_size": len(X_test),
+        "test_base_rate": round(float(base_rate), 4),
         "test_accuracy": round(test_accuracy, 4),
         "cv_accuracy": round(cv_scores.mean(), 4),
         "cv_std": round(cv_scores.std(), 4),
         "feature_importances": {k: round(v, 4) for k, v in sorted_imp},
-        "features": SIGNAL_FEATURES,
+        "features": FEATURE_NAMES,
     }
     with open(MODEL_META_FILE, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -266,8 +367,9 @@ def predict_score(signal_scores: dict) -> Optional[dict]:
         with open(MODEL_META_FILE) as f:
             metadata = json.load(f)
 
-        # Build feature vector
+        # Build feature vector — live picks are always the current version
         features = [signal_scores.get(s, 0) for s in SIGNAL_FEATURES]
+        features.append(CURRENT_SIGNAL_VERSION)
         X = np.array([features])
 
         # Predict probability
@@ -333,6 +435,8 @@ def print_status():
         print(f"  Accuracy: {meta.get('test_accuracy', 0):.1%}")
         print(f"  CV accuracy: {meta.get('cv_accuracy', 0):.1%} (±{meta.get('cv_std', 0):.1%})")
         print(f"  Trained on: {meta.get('samples', 0)} samples")
+        print(f"  Split: {meta.get('split_method', '?')} | test n={meta.get('test_size', '?')} "
+              f"| base rate {meta.get('test_base_rate', 0):.1%}")
         print(f"\n  Feature importances:")
         for feat, imp in meta.get("feature_importances", {}).items():
             bar = "█" * int(imp * 50)
